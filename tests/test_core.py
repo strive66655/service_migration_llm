@@ -12,10 +12,12 @@ if str(SRC) not in sys.path:
 import numpy as np
 
 from mdp_migration.core import CostParams, build_1d_transition_matrix, evaluate_policy, hex_grid_coordinates, hex_neighbor_matrix, map_threshold_actions_to_2d
+from mdp_migration.llm import DEFAULT_SAFE_CONTROL, apply_control_params, build_llm_state, build_prompt, query_llm, validate_llm_output
 from mdp_migration.policies import ModifiedPolicyIterationPolicy, PolicyContext, PolicyIterationPolicy
 from mdp_migration.random_walk import RandomWalkConfig, run_random_walk
 import mdp_migration.real_trace as real_trace_module
 from mdp_migration.real_trace import RealTraceConfig, run_real_trace
+from mdp_migration.single_user_llm import SingleUserLLMConfig, run_single_user_llm_loop
 
 
 class CoreTests(unittest.TestCase):
@@ -93,6 +95,86 @@ class CoreTests(unittest.TestCase):
         self.assertIn("summary", result)
         self.assertIn("gain_stats", result)
         self.assertEqual(len(result["avg_cost_series"]["threshold"]), 40)
+
+    def test_llm_validation_clips_and_falls_back(self) -> None:
+        validated = validate_llm_output(
+            {
+                "objective_mode": "latency_first",
+                "gamma": 1.4,
+                "migration_weight": -2,
+                "transmission_weight": 3,
+                "solver_mode": "freeform",
+                "reason": "test",
+            },
+            DEFAULT_SAFE_CONTROL,
+        )
+        self.assertEqual(validated.solver_mode, "mdp")
+        self.assertAlmostEqual(validated.gamma, 0.99)
+        self.assertAlmostEqual(validated.migration_weight, 0.5)
+        self.assertTrue(validated.used_fallback)
+
+    def test_llm_prompt_and_query(self) -> None:
+        llm_state = build_llm_state(
+            {"state_index": 3, "service_index": 3, "distance_to_user": 2, "recent_direction": 1},
+            {"recent_service_distances": [1, 2], "recent_migrations": [0, 1], "previous_solver_mode": "mdp"},
+            "latency_sensitive",
+            "当前业务对时延敏感，可接受必要迁移",
+        )
+        prompt = build_prompt(llm_state)
+        raw = query_llm(prompt, state=llm_state)
+        self.assertEqual(raw["objective_mode"], "latency_first")
+        self.assertIn("solver_mode", raw)
+
+    def test_apply_control_params_changes_weights(self) -> None:
+        base = CostParams(0.9, 0.8, 2.0, -1.0, 1.0, -0.5)
+        controlled = apply_control_params(
+            base,
+            validate_llm_output(
+                {
+                    "objective_mode": "stability_first",
+                    "gamma": 0.8,
+                    "migration_weight": 1.5,
+                    "transmission_weight": 0.75,
+                    "solver_mode": "threshold",
+                    "reason": "stable",
+                }
+            ),
+        )
+        self.assertAlmostEqual(controlled.const_factor_migrate, 3.0)
+        self.assertAlmostEqual(controlled.const_factor_trans, 0.75)
+        self.assertAlmostEqual(controlled.gamma, 0.8)
+
+    def test_single_user_llm_loop_reports_fixed_evaluation_metrics(self) -> None:
+        result = run_single_user_llm_loop(
+            SingleUserLLMConfig(
+                use_2d=False,
+                sim_seed=1,
+                num_steps=12,
+                llm_refresh_interval=3,
+                num_states_left=2,
+                num_states_right=4,
+                business_profile="latency_sensitive",
+                operator_text="当前业务对时延敏感，可接受必要迁移",
+            )
+        )
+        self.assertIn("llm_meta_mdp", result["method_summaries"])
+        self.assertIn("evaluation_metric_definition", result)
+        self.assertIn("evaluation_cost", result["method_summaries"]["llm_meta_mdp"])
+        self.assertGreater(len(result["llm_decisions"]), 0)
+
+    def test_single_user_llm_timeout_falls_back(self) -> None:
+        result = run_single_user_llm_loop(
+            SingleUserLLMConfig(
+                use_2d=False,
+                sim_seed=2,
+                num_steps=6,
+                llm_refresh_interval=2,
+                num_states_left=1,
+                num_states_right=3,
+                failure_mode="timeout",
+            )
+        )
+        self.assertTrue(result["llm_decisions"][0]["validated_control"]["used_fallback"])
 
 
 if __name__ == "__main__":

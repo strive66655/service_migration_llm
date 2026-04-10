@@ -134,3 +134,161 @@ def plot_real_trace_results(results: dict, output_dir: str | None = None) -> Non
         plt.close(fig2)
     else:
         plt.show()
+
+def plot_single_user_llm_results(results: dict, output_dir: str | None = None) -> None:
+    method_summaries = results["method_summaries"]
+    methods = list(method_summaries.keys())
+    labels = [m.replace("_", "\n") for m in methods]
+    eval_cost = [method_summaries[m]["evaluation_cost"] for m in methods]
+    service_distance = [method_summaries[m]["avg_service_distance"] for m in methods]
+    migration_count = [method_summaries[m]["avg_migration_count"] for m in methods]
+    jitter_ratio = [method_summaries[m]["jitter_ratio"] for m in methods]
+
+    fig1, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
+    axes = axes.reshape(-1)
+    series = [
+        ("Evaluation Cost", eval_cost, "#3b82f6"),
+        ("Avg Service Distance", service_distance, "#10b981"),
+        ("Avg Migration Count", migration_count, "#f59e0b"),
+        ("Jitter Ratio", jitter_ratio, "#ef4444"),
+    ]
+    x = np.arange(len(methods))
+    for ax, (title, values, color) in zip(axes, series):
+        ax.bar(x, values, color=color)
+        ax.set_title(title)
+        ax.set_xticks(x, labels)
+        ax.tick_params(axis="x", labelrotation=20)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+
+    llm_trace = results["method_traces"]["llm_meta_mdp"]
+    baseline_trace = results["method_traces"]["mdp_baseline"]
+    steps = np.arange(len(llm_trace["service_distance"]))
+    fig2, axes2 = plt.subplots(2, 1, figsize=(11, 8), sharex=True, constrained_layout=True)
+    axes2[0].plot(steps, baseline_trace["service_distance"], label="MDP baseline", color="#6366f1")
+    axes2[0].plot(steps, llm_trace["service_distance"], label="LLM-Meta-MDP", color="#dc2626")
+    axes2[0].set_ylabel("Service Distance")
+    axes2[0].legend()
+
+    axes2[1].step(steps, baseline_trace["migration_flag"], where="mid", label="MDP baseline", color="#6366f1")
+    axes2[1].step(steps, llm_trace["migration_flag"], where="mid", label="LLM-Meta-MDP", color="#dc2626")
+    axes2[1].set_xlabel("Step")
+    axes2[1].set_ylabel("Migration Flag")
+    axes2[1].legend()
+
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fig1.savefig(Path(output_dir) / "single_user_llm_summary.png", dpi=200, bbox_inches="tight")
+        fig2.savefig(Path(output_dir) / "single_user_llm_trace.png", dpi=200, bbox_inches="tight")
+        plt.close(fig1)
+        plt.close(fig2)
+    else:
+        plt.show()
+
+
+def plot_single_user_llm_batch_results(results: dict, output_dir: str | None = None) -> None:
+    scenario_names = list(results["scenarios"].keys())
+    methods = list(next(iter(results["scenarios"].values()))["method_summaries"].keys())
+    metrics = ["evaluation_cost", "avg_service_distance", "avg_migration_count", "jitter_ratio"]
+    titles = {
+        "evaluation_cost": "Evaluation Cost",
+        "avg_service_distance": "Avg Service Distance",
+        "avg_migration_count": "Avg Migration Count",
+        "jitter_ratio": "Jitter Ratio",
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+    axes = axes.reshape(-1)
+    width = 0.14
+    x = np.arange(len(scenario_names))
+    for ax, metric in zip(axes, metrics):
+        for idx, method in enumerate(methods):
+            values = [results["scenarios"][scenario]["method_summaries"][method][metric] for scenario in scenario_names]
+            errors = [results["scenarios"][scenario]["method_summary_std"][method][metric] for scenario in scenario_names]
+            ax.bar(
+                x + (idx - (len(methods) - 1) / 2) * width,
+                values,
+                width=width,
+                yerr=errors,
+                capsize=3,
+                label=method if metric == metrics[0] else None,
+            )
+        ax.set_title(titles[metric])
+        ax.set_xticks(x, scenario_names)
+        ax.tick_params(axis="x", labelrotation=20)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+    axes[0].legend()
+
+    fig2, ax2 = plt.subplots(figsize=(12, 5), constrained_layout=True)
+    llm_values = [results["scenarios"][scenario]["method_summaries"]["llm_meta_mdp"]["evaluation_cost"] for scenario in scenario_names]
+    llm_errors = [results["scenarios"][scenario]["method_summary_std"]["llm_meta_mdp"]["evaluation_cost"] for scenario in scenario_names]
+    baseline_values = [results["scenarios"][scenario]["method_summaries"]["mdp_baseline"]["evaluation_cost"] for scenario in scenario_names]
+    baseline_errors = [results["scenarios"][scenario]["method_summary_std"]["mdp_baseline"]["evaluation_cost"] for scenario in scenario_names]
+    ax2.errorbar(scenario_names, baseline_values, yerr=baseline_errors, marker="o", capsize=4, label="MDP baseline", color="#6366f1")
+    ax2.errorbar(scenario_names, llm_values, yerr=llm_errors, marker="o", capsize=4, label="LLM-Meta-MDP", color="#dc2626")
+    ax2.set_ylabel("Evaluation Cost")
+    ax2.set_title("LLM vs MDP Across Scenarios")
+    ax2.legend()
+    ax2.tick_params(axis="x", labelrotation=20)
+
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(output_dir) / "single_user_llm_batch_summary.png", dpi=200, bbox_inches="tight")
+        fig2.savefig(Path(output_dir) / "single_user_llm_batch_compare.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        plt.close(fig2)
+    else:
+        plt.show()
+
+
+def plot_single_user_llm_tradeoff(results: dict, output_dir: str | None = None) -> None:
+    scenario_names = list(results["scenarios"].keys())
+    fig, ax = plt.subplots(figsize=(9, 6), constrained_layout=True)
+    baseline_x = [results["scenarios"][scenario]["method_summaries"]["mdp_baseline"]["avg_migration_count"] for scenario in scenario_names]
+    baseline_y = [results["scenarios"][scenario]["method_summaries"]["mdp_baseline"]["avg_service_distance"] for scenario in scenario_names]
+    llm_x = [results["scenarios"][scenario]["method_summaries"]["llm_meta_mdp"]["avg_migration_count"] for scenario in scenario_names]
+    llm_y = [results["scenarios"][scenario]["method_summaries"]["llm_meta_mdp"]["avg_service_distance"] for scenario in scenario_names]
+    ax.scatter(baseline_x, baseline_y, color="#6366f1", label="MDP baseline", s=80)
+    ax.scatter(llm_x, llm_y, color="#dc2626", label="LLM-Meta-MDP", s=80)
+    for idx, scenario in enumerate(scenario_names):
+        ax.annotate(scenario, (llm_x[idx], llm_y[idx]), textcoords="offset points", xytext=(6, 6))
+    ax.set_xlabel("Average Migration Count")
+    ax.set_ylabel("Average Service Distance")
+    ax.set_title("Trade-off Between Migration Frequency and Service Distance")
+    ax.legend()
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(output_dir) / "single_user_llm_tradeoff.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_single_user_llm_parameter_trace(results: dict, output_dir: str | None = None) -> None:
+    decisions = results.get("llm_decisions", [])
+    if not decisions:
+        return
+    steps = [decision["step"] for decision in decisions]
+    gamma = [decision["validated_control"]["gamma"] for decision in decisions]
+    migration_weight = [decision["validated_control"]["migration_weight"] for decision in decisions]
+    transmission_weight = [decision["validated_control"]["transmission_weight"] for decision in decisions]
+    solver_mode_map = {"myopic": 0, "threshold": 1, "mdp": 2}
+    solver_values = [solver_mode_map.get(decision["validated_control"]["solver_mode"], -1) for decision in decisions]
+
+    fig, axes = plt.subplots(4, 1, figsize=(10, 10), sharex=True, constrained_layout=True)
+    axes[0].plot(steps, gamma, marker="o", color="#2563eb")
+    axes[0].set_ylabel("gamma")
+    axes[1].plot(steps, migration_weight, marker="o", color="#d97706")
+    axes[1].set_ylabel("migration weight")
+    axes[2].plot(steps, transmission_weight, marker="o", color="#059669")
+    axes[2].set_ylabel("transmission weight")
+    axes[3].step(steps, solver_values, where="mid", color="#7c3aed")
+    axes[3].set_yticks([0, 1, 2], ["myopic", "threshold", "mdp"])
+    axes[3].set_ylabel("solver")
+    axes[3].set_xlabel("Decision Refresh Step")
+    fig.suptitle("LLM Control Parameter Evolution")
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(output_dir) / "single_user_llm_parameter_trace.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
