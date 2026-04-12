@@ -292,3 +292,58 @@ def plot_single_user_llm_parameter_trace(results: dict, output_dir: str | None =
         plt.close(fig)
     else:
         plt.show()
+
+
+def plot_single_user_llm_multi_agent_diagnostics(results: dict, output_dir: str | None = None) -> None:
+    decisions = results.get("llm_decisions", [])
+    if not decisions:
+        return
+    multi_agent_decisions = [decision for decision in decisions if decision.get("controller_mode") == "multi_agent"]
+    if not multi_agent_decisions:
+        return
+
+    steps = [decision["step"] for decision in multi_agent_decisions]
+    agreement_map = {"low": 0, "medium": 1, "high": 2}
+    decision_source_map = {
+        "single_agent_direct": 0,
+        "multi_agent_merged": 1,
+        "fallback_partial": 2,
+        "fallback_default": 3,
+    }
+    agreement_values = [agreement_map.get(decision.get("agent_agreement", "low"), 0) for decision in multi_agent_decisions]
+    fallback_values = [1 if decision.get("fallback_used") else 0 for decision in multi_agent_decisions]
+    decision_source_values = [decision_source_map.get(decision.get("final_decision_source", "fallback_default"), 3) for decision in multi_agent_decisions]
+    forecaster_latency = [decision.get("agent_metrics", {}).get("forecaster", {}).get("latency_ms", np.nan) for decision in multi_agent_decisions]
+    policy_latency = [decision.get("agent_metrics", {}).get("policy_advisor", {}).get("latency_ms", np.nan) for decision in multi_agent_decisions]
+
+    objective_mode_map = {"stability_first": 0, "balanced": 1, "latency_first": 2}
+    objective_mode_values = [objective_mode_map.get(decision["validated_control"]["objective_mode"], 1) for decision in multi_agent_decisions]
+
+    fig, axes = plt.subplots(4, 1, figsize=(11, 10), sharex=True, constrained_layout=True)
+    axes[0].step(steps, agreement_values, where="mid", color="#0f766e")
+    axes[0].set_yticks([0, 1, 2], ["low", "medium", "high"])
+    axes[0].set_ylabel("Agreement")
+
+    axes[1].step(steps, decision_source_values, where="mid", color="#7c3aed")
+    axes[1].set_yticks([0, 1, 2, 3], ["single", "merged", "partial", "default"])
+    axes[1].set_ylabel("Decision Source")
+
+    axes[2].step(steps, fallback_values, where="mid", color="#dc2626", label="fallback")
+    axes[2].step(steps, objective_mode_values, where="mid", color="#2563eb", label="objective mode")
+    axes[2].set_yticks([0, 1, 2], ["stability", "balanced", "latency"])
+    axes[2].set_ylabel("Fallback / Objective")
+    axes[2].legend()
+
+    axes[3].plot(steps, forecaster_latency, marker="o", color="#f59e0b", label="forecaster")
+    axes[3].plot(steps, policy_latency, marker="o", color="#059669", label="policy advisor")
+    axes[3].set_ylabel("Latency (ms)")
+    axes[3].set_xlabel("Decision Refresh Step")
+    axes[3].legend()
+    fig.suptitle("Multi-Agent Decision Diagnostics")
+
+    if output_dir:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(output_dir) / "single_user_llm_multi_agent_diagnostics.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()

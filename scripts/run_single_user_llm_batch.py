@@ -29,6 +29,7 @@ def _scenario_configs(
     steps: int,
     seeds: list[int],
     llm_refresh_interval: int,
+    controller_mode: str,
     llm_backend: str,
     llm_model: str,
     llm_api_base: str,
@@ -40,6 +41,7 @@ def _scenario_configs(
         "use_2d": use_2d,
         "num_steps": steps,
         "llm_refresh_interval": llm_refresh_interval,
+        "controller_mode": controller_mode,
         "llm_backend": llm_backend,
         "llm_model": llm_model,
         "llm_api_base": llm_api_base,
@@ -209,6 +211,7 @@ def main() -> None:
     parser.add_argument("--use-1d", action="store_true")
     parser.add_argument("--steps", type=int, default=120)
     parser.add_argument("--llm-refresh-interval", type=int, default=5)
+    parser.add_argument("--controller-mode", choices=["single_agent", "multi_agent"], default="single_agent")
     parser.add_argument("--llm-backend", default="mock")
     parser.add_argument("--llm-model", default="openai/gpt-5.3-chat")
     parser.add_argument("--llm-api-base", default="https://openrouter.ai/api/v1")
@@ -225,6 +228,7 @@ def main() -> None:
         args.steps,
         list(args.seeds),
         args.llm_refresh_interval,
+        args.controller_mode,
         args.llm_backend,
         args.llm_model,
         args.llm_api_base,
@@ -237,6 +241,7 @@ def main() -> None:
             "use_2d": not args.use_1d,
             "steps": args.steps,
             "llm_refresh_interval": args.llm_refresh_interval,
+            "controller_mode": args.controller_mode,
             "llm_backend": args.llm_backend,
             "llm_model": args.llm_model,
             "seeds": list(args.seeds),

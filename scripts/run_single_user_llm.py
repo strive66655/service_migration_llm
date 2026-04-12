@@ -11,12 +11,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from mdp_migration.io import save_json
+from mdp_migration.plotting import plot_single_user_llm_multi_agent_diagnostics, plot_single_user_llm_parameter_trace, plot_single_user_llm_results
 from mdp_migration.single_user_llm import SingleUserLLMConfig, run_single_user_llm_loop
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-dir", default=None)
+    parser.add_argument("--plot", action="store_true")
     parser.add_argument("--use-1d", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--steps", type=int, default=60)
@@ -28,6 +30,7 @@ def main() -> None:
     parser.add_argument("--llm-api-base", default="https://openrouter.ai/api/v1")
     parser.add_argument("--llm-api-key-env", default="OPENROUTER_API_KEY")
     parser.add_argument("--llm-timeout-sec", type=float, default=30.0)
+    parser.add_argument("--controller-mode", choices=["single_agent", "multi_agent"], default="single_agent")
     parser.add_argument("--business-profile", default="balanced")
     parser.add_argument("--operator-text", default="")
     parser.add_argument("--failure-mode", default=None)
@@ -49,6 +52,7 @@ def main() -> None:
         llm_api_base=args.llm_api_base,
         llm_api_key_env=args.llm_api_key_env,
         llm_timeout_sec=args.llm_timeout_sec,
+        controller_mode=args.controller_mode,
         business_profile=args.business_profile,
         operator_text=args.operator_text,
         num_states_left=args.num_states_left,
@@ -69,6 +73,11 @@ def main() -> None:
     if args.save_dir:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
         save_json(Path(args.save_dir) / "single_user_llm_results.json", results)
+    if args.plot:
+        plot_output_dir = args.save_dir
+        plot_single_user_llm_results(results, plot_output_dir)
+        plot_single_user_llm_parameter_trace(results, plot_output_dir)
+        plot_single_user_llm_multi_agent_diagnostics(results, plot_output_dir)
 
 
 if __name__ == "__main__":

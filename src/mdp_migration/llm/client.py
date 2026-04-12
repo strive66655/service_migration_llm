@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -10,48 +10,121 @@ import requests
 from requests import RequestException
 
 
-_OPENROUTER_SCHEMA = {
-    "name": "single_user_service_migration_control",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "objective_mode": {
-                "type": "string",
-                "enum": ["latency_first", "stability_first", "balanced"],
-                "description": "High-level optimization preference.",
+_OPENROUTER_SCHEMAS = {
+    "control": {
+        "name": "single_user_service_migration_control",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "objective_mode": {
+                    "type": "string",
+                    "enum": ["latency_first", "stability_first", "balanced"],
+                    "description": "High-level optimization preference.",
+                },
+                "gamma": {
+                    "type": "number",
+                    "minimum": 0.7,
+                    "maximum": 0.99,
+                    "description": "Discount factor for the lower-level MDP.",
+                },
+                "migration_weight": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 1.8,
+                    "description": "Weight applied to migration cost terms.",
+                },
+                "transmission_weight": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 1.8,
+                    "description": "Weight applied to transmission distance cost terms.",
+                },
+                "solver_mode": {
+                    "type": "string",
+                    "enum": ["threshold", "myopic", "mdp"],
+                    "description": "Lower-level solver choice.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short explanation of the control decision.",
+                },
             },
-            "gamma": {
-                "type": "number",
-                "minimum": 0.7,
-                "maximum": 0.99,
-                "description": "Discount factor for the lower-level MDP.",
-            },
-            "migration_weight": {
-                "type": "number",
-                "minimum": 0.5,
-                "maximum": 1.8,
-                "description": "Weight applied to migration cost terms.",
-            },
-            "transmission_weight": {
-                "type": "number",
-                "minimum": 0.5,
-                "maximum": 1.8,
-                "description": "Weight applied to transmission distance cost terms.",
-            },
-            "solver_mode": {
-                "type": "string",
-                "enum": ["threshold", "myopic", "mdp"],
-                "description": "Lower-level solver choice.",
-            },
-            "reason": {
-                "type": "string",
-                "description": "Short explanation of the control decision.",
-            },
+            "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "solver_mode", "reason"],
+            "additionalProperties": False,
         },
-        "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "solver_mode", "reason"],
-        "additionalProperties": False,
     },
+    "forecast": {
+        "name": "single_user_service_migration_forecast",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "distance_trend": {
+                    "type": "string",
+                    "enum": ["moving_away", "stable", "approaching"],
+                },
+                "mobility_level": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                },
+                "stability_risk": {
+                    "type": "string",
+                    "enum": ["low", "high"],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short explanation of the mobility summary.",
+                },
+            },
+            "required": ["distance_trend", "mobility_level", "stability_risk", "reason"],
+            "additionalProperties": False,
+        },
+    },
+    "policy_advice": {
+        "name": "single_user_service_migration_policy_advice",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "objective_mode": {
+                    "type": "string",
+                    "enum": ["latency_first", "stability_first", "balanced"],
+                },
+                "gamma": {
+                    "type": "number",
+                    "minimum": 0.7,
+                    "maximum": 0.99,
+                },
+                "migration_weight": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 1.8,
+                },
+                "transmission_weight": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 1.8,
+                },
+                "solver_mode": {
+                    "type": "string",
+                    "enum": ["threshold", "myopic", "mdp"],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short explanation of the control recommendation.",
+                },
+            },
+            "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "solver_mode", "reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+_SYSTEM_PROMPTS = {
+    "control": "You control a single-user service migration system. Return only valid JSON that matches the provided schema.",
+    "forecast": "You summarize short-horizon mobility state for service migration. Return only valid JSON that matches the provided schema.",
+    "policy_advice": "You recommend safe migration control parameters from a summarized state. Return only valid JSON that matches the provided schema.",
 }
 
 
@@ -62,14 +135,47 @@ def _extract_state_from_prompt(prompt: str) -> dict[str, Any]:
     return json.loads(prompt.split(marker, 1)[1])
 
 
-def _mock_query(llm_state: dict[str, Any], failure_mode: str | None = None) -> dict[str, Any]:
-    if failure_mode == "timeout":
-        raise TimeoutError("Mock LLM timed out.")
+def _mock_forecast_query(llm_state: dict[str, Any], failure_mode: str | None = None) -> dict[str, Any]:
+    current_state = llm_state.get("current_state", {})
+    history = llm_state.get("recent_history", {})
+    distance_delta = int(current_state.get("distance_delta", 0))
+    recent_migrations = int(history.get("migration_count_recent", 0))
 
+    if distance_delta > 0:
+        distance_trend = "moving_away"
+    elif distance_delta < 0:
+        distance_trend = "approaching"
+    else:
+        distance_trend = "stable"
+
+    if abs(distance_delta) >= 2:
+        mobility_level = "high"
+    elif abs(distance_delta) == 1 or recent_migrations >= 2:
+        mobility_level = "medium"
+    else:
+        mobility_level = "low"
+
+    stability_risk = "high" if recent_migrations >= 2 or mobility_level == "high" else "low"
+    response = {
+        "distance_trend": distance_trend,
+        "mobility_level": mobility_level,
+        "stability_risk": stability_risk,
+        "reason": "mock mobility summary",
+    }
+    if failure_mode == "invalid_enum":
+        response["mobility_level"] = "extreme"
+    elif failure_mode == "missing_field":
+        response.pop("stability_risk", None)
+    elif failure_mode == "invalid_json":
+        return {"payload": "{broken json}"}
+    return response
+
+
+def _mock_control_like_query(llm_state: dict[str, Any], failure_mode: str | None = None) -> dict[str, Any]:
     business_profile = str(llm_state.get("business_profile", "balanced"))
     operator_text = str(llm_state.get("operator_text", ""))
     current_state = llm_state.get("current_state", {})
-    history = llm_state.get("history", {})
+    history = llm_state.get("history", llm_state.get("recent_history", {}))
 
     latency_signal = any(token in operator_text for token in ("低时延", "AR", "时延敏感", "latency"))
     stability_signal = any(token in operator_text for token in ("优先稳定", "减少切换", "避免频繁", "短暂", "过渡", "误导"))
@@ -141,6 +247,16 @@ def _mock_query(llm_state: dict[str, Any], failure_mode: str | None = None) -> d
     return response
 
 
+def _mock_query(llm_state: dict[str, Any], schema_name: str, failure_mode: str | None = None) -> dict[str, Any]:
+    if failure_mode == "timeout":
+        raise TimeoutError("Mock LLM timed out.")
+    if schema_name == "forecast":
+        return _mock_forecast_query(llm_state, failure_mode=failure_mode)
+    if schema_name in {"control", "policy_advice"}:
+        return _mock_control_like_query(llm_state, failure_mode=failure_mode)
+    raise ValueError(f"Unsupported schema_name for mock backend: {schema_name}")
+
+
 def _extract_json_object(text: str) -> str:
     start = text.find("{")
     if start == -1:
@@ -160,9 +276,9 @@ def _extract_json_object(text: str) -> str:
             continue
         if ch == '"':
             in_string = True
-        elif ch == '{':
+        elif ch == "{":
             depth += 1
-        elif ch == '}':
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 return text[start : idx + 1]
@@ -200,19 +316,22 @@ def _openrouter_query(
     api_base: str,
     api_key_env: str,
     timeout_sec: float,
+    schema_name: str,
     max_retries: int = 2,
     retry_delay_sec: float = 1.0,
 ) -> dict[str, Any]:
     api_key = os.getenv(api_key_env)
     if not api_key:
         raise RuntimeError(f"Environment variable {api_key_env} is not set.")
+    if schema_name not in _OPENROUTER_SCHEMAS:
+        raise ValueError(f"Unsupported schema_name: {schema_name}")
 
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": "You control a single-user service migration system. Return only valid JSON that matches the provided schema.",
+                "content": _SYSTEM_PROMPTS[schema_name],
             },
             {
                 "role": "user",
@@ -222,7 +341,7 @@ def _openrouter_query(
         "temperature": 0,
         "response_format": {
             "type": "json_schema",
-            "json_schema": _OPENROUTER_SCHEMA,
+            "json_schema": _OPENROUTER_SCHEMAS[schema_name],
         },
     }
     headers = {
@@ -278,10 +397,11 @@ def query_llm(
     api_base: str = "https://openrouter.ai/api/v1",
     api_key_env: str = "OPENROUTER_API_KEY",
     timeout_sec: float = 30.0,
+    schema_name: str = "control",
 ) -> dict[str, Any]:
     llm_state = state if state is not None else _extract_state_from_prompt(prompt)
     if backend == "mock":
-        return _mock_query(llm_state, failure_mode=failure_mode)
+        return _mock_query(llm_state, schema_name=schema_name, failure_mode=failure_mode)
     if backend == "openrouter":
         if failure_mode == "timeout":
             raise TimeoutError("Injected timeout before OpenRouter request.")
@@ -291,5 +411,6 @@ def query_llm(
             api_base=api_base,
             api_key_env=api_key_env,
             timeout_sec=timeout_sec,
+            schema_name=schema_name,
         )
     raise ValueError(f"Unsupported llm backend: {backend}")

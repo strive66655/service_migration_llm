@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from .core import CostParams, PolicyResult, build_1d_transition_matrix, build_random_walk_2d_transition_matrix, evaluate_policy, hex_grid_coordinates, hop_distance_matrix, map_threshold_actions_to_2d, reduced_chain_from_stay_probability
-from .llm import DEFAULT_SAFE_CONTROL, apply_control_params, build_llm_state, build_prompt, query_llm, validate_llm_output
+from .llm import DEFAULT_SAFE_CONTROL, apply_control_params, build_llm_state, build_prompt, build_shared_control_state, query_llm, query_multi_agent_control, validate_llm_output
 from .policies import AlwaysMigratePolicy, ModifiedPolicyIterationPolicy, MyopicPolicy, NeverMigratePolicy, PolicyContext, PolicyIterationPolicy
 
 
@@ -25,8 +25,11 @@ class SingleUserLLMConfig:
     llm_api_base: str = "https://openrouter.ai/api/v1"
     llm_api_key_env: str = "OPENROUTER_API_KEY"
     llm_timeout_sec: float = 30.0
+    controller_mode: str = "single_agent"
     business_profile: str = "balanced"
     operator_text: str = ""
+    agent_models: dict[str, str] | None = None
+    agent_backends: dict[str, str] | None = None
     num_states_left: int = 0
     num_states_right: int = 10
     num_states_2d: int = 6
@@ -185,6 +188,51 @@ def _collect_summary(trace: dict[str, list[float] | list[int]]) -> dict[str, Any
     }
 
 
+def _build_shared_state_for_step(env: _EnvironmentSpec, current_state: int, history: dict[str, Any], config: SingleUserLLMConfig) -> dict[str, Any]:
+    return build_shared_control_state(
+        {
+            "state_index": current_state,
+            "service_index": current_state,
+            "distance_to_user": _distance(env, current_state, env.zero_state_index),
+            "recent_direction": 0 if len(history["recent_service_distances"]) < 2 else int(history["recent_service_distances"][-1] - history["recent_service_distances"][-2]),
+        },
+        history,
+        config.business_profile,
+        config.operator_text,
+    )
+
+
+def _single_agent_diagnostics(
+    shared_control_state: dict[str, Any],
+    llm_raw: dict[str, Any] | None,
+    llm_control: Any,
+) -> dict[str, Any]:
+    validation_notes = list(llm_control.validation_notes)
+    if llm_raw is None:
+        final_decision_source = "fallback_default"
+    elif llm_control.used_fallback:
+        final_decision_source = "fallback_partial"
+    else:
+        final_decision_source = "single_agent_direct"
+    return {
+        "shared_control_state": shared_control_state,
+        "forecaster_raw_output": None,
+        "forecaster_output": None,
+        "policy_advisor_raw_output": None,
+        "policy_advisor_output": None,
+        "draft_control": llm_raw,
+        "final_safe_control": asdict(llm_control),
+        "validation_notes": validation_notes,
+        "fallback_used": bool(validation_notes),
+        "fallback_reason": ", ".join(validation_notes) if validation_notes else "",
+        "final_decision_source": final_decision_source,
+        "agent_agreement": "high",
+        "agent_metrics": {
+            "single_agent": {"latency_ms": 0.0, "call_count": 1},
+        },
+    }
+
+
 def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
     env, base_cost_params = _build_environment(config)
     standard_context = _standard_context(env, base_cost_params)
@@ -229,40 +277,60 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
     for step in range(config.num_steps):
         if step % max(config.llm_refresh_interval, 1) == 0:
             current_state = int(methods["llm_meta_mdp"]["state"])
-            llm_state = build_llm_state(
-                {
-                    "state_index": current_state,
-                    "service_index": current_state,
-                    "distance_to_user": _distance(env, current_state, env.zero_state_index),
-                    "recent_direction": 0 if len(llm_history["recent_service_distances"]) < 2 else int(llm_history["recent_service_distances"][-1] - llm_history["recent_service_distances"][-2]),
-                },
-                llm_history,
-                config.business_profile,
-                config.operator_text,
-            )
-            prompt = build_prompt(llm_state)
-            try:
-                llm_raw = query_llm(
-                    prompt,
-                    state=llm_state,
+            shared_control_state = _build_shared_state_for_step(env, current_state, llm_history, config)
+            if config.controller_mode == "multi_agent":
+                diagnostics = query_multi_agent_control(
+                    shared_control_state,
                     failure_mode=config.failure_mode if step == 0 else None,
                     backend=config.llm_backend,
                     model=config.llm_model,
                     api_base=config.llm_api_base,
                     api_key_env=config.llm_api_key_env,
                     timeout_sec=config.llm_timeout_sec,
+                    agent_models=config.agent_models,
+                    agent_backends=config.agent_backends,
                 )
-            except TimeoutError:
-                llm_raw = None
-            llm_control = validate_llm_output(llm_raw, DEFAULT_SAFE_CONTROL)
+                llm_control = validate_llm_output(diagnostics["final_safe_control"], DEFAULT_SAFE_CONTROL)
+            else:
+                llm_state = build_llm_state(
+                    {
+                        "state_index": current_state,
+                        "service_index": current_state,
+                        "distance_to_user": shared_control_state["current_state"]["distance_to_user"],
+                        "recent_direction": shared_control_state["current_state"]["recent_direction"],
+                    },
+                    {
+                        "recent_service_distances": shared_control_state["recent_service_distances"],
+                        "recent_migrations": shared_control_state["recent_migrations"],
+                        "previous_solver_mode": shared_control_state["previous_solver_mode"],
+                    },
+                    config.business_profile,
+                    config.operator_text,
+                )
+                prompt = build_prompt(llm_state)
+                try:
+                    llm_raw = query_llm(
+                        prompt,
+                        state=llm_state,
+                        failure_mode=config.failure_mode if step == 0 else None,
+                        backend=config.llm_backend,
+                        model=config.llm_model,
+                        api_base=config.llm_api_base,
+                        api_key_env=config.llm_api_key_env,
+                        timeout_sec=config.llm_timeout_sec,
+                    )
+                except TimeoutError:
+                    llm_raw = None
+                llm_control = validate_llm_output(llm_raw, DEFAULT_SAFE_CONTROL)
+                diagnostics = _single_agent_diagnostics(shared_control_state, llm_raw, llm_control)
             llm_cost_params = apply_control_params(base_cost_params, llm_control)
             llm_policy_actions = _solve_policy_actions(env, llm_cost_params, llm_control.solver_mode).actions
             llm_history["previous_solver_mode"] = llm_control.solver_mode
             llm_decisions.append(
                 {
                     "step": step,
-                    "prompt_state": llm_state,
-                    "raw_output": llm_raw,
+                    "controller_mode": config.controller_mode,
+                    **diagnostics,
                     "validated_control": asdict(llm_control),
                 }
             )
