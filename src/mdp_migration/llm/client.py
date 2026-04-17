@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -40,17 +40,12 @@ _OPENROUTER_SCHEMAS = {
                     "maximum": 1.8,
                     "description": "Weight applied to transmission distance cost terms.",
                 },
-                "solver_mode": {
-                    "type": "string",
-                    "enum": ["threshold", "myopic", "mdp"],
-                    "description": "Lower-level solver choice.",
-                },
                 "reason": {
                     "type": "string",
                     "description": "Short explanation of the control decision.",
                 },
             },
-            "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "solver_mode", "reason"],
+            "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "reason"],
             "additionalProperties": False,
         },
     },
@@ -106,16 +101,12 @@ _OPENROUTER_SCHEMAS = {
                     "minimum": 0.5,
                     "maximum": 1.8,
                 },
-                "solver_mode": {
-                    "type": "string",
-                    "enum": ["threshold", "myopic", "mdp"],
-                },
                 "reason": {
                     "type": "string",
                     "description": "Short explanation of the control recommendation.",
                 },
             },
-            "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "solver_mode", "reason"],
+            "required": ["objective_mode", "gamma", "migration_weight", "transmission_weight", "reason"],
             "additionalProperties": False,
         },
     },
@@ -171,31 +162,72 @@ def _mock_forecast_query(llm_state: dict[str, Any], failure_mode: str | None = N
     return response
 
 
-def _mock_control_like_query(llm_state: dict[str, Any], failure_mode: str | None = None) -> dict[str, Any]:
-    business_profile = str(llm_state.get("business_profile", "balanced"))
-    operator_text = str(llm_state.get("operator_text", ""))
-    current_state = llm_state.get("current_state", {})
-    history = llm_state.get("history", llm_state.get("recent_history", {}))
+def _normalize_mock_control_state(llm_state: dict[str, Any], schema_name: str) -> dict[str, Any]:
+    if schema_name == "policy_advice" and "shared_control_state" in llm_state:
+        shared = llm_state.get("shared_control_state", {})
+        recent_history = shared.get("recent_history", {})
+        return {
+            "business_profile": shared.get("business_profile", "balanced"),
+            "operator_text": shared.get("operator_text", ""),
+            "current_state": shared.get("current_state", {}),
+            "history": {
+                "recent_service_distances": shared.get("recent_service_distances", []),
+                "recent_migrations": shared.get("recent_migrations", []),
+                "migration_count_recent": recent_history.get("migration_count_recent", 0),
+                "average_service_distance_recent": recent_history.get("average_service_distance_recent", 0.0),
+            },
+            "forecast": llm_state.get("forecast", {}),
+        }
+    return llm_state
 
-    latency_signal = any(token in operator_text for token in ("低时延", "AR", "时延敏感", "latency"))
-    stability_signal = any(token in operator_text for token in ("优先稳定", "减少切换", "避免频繁", "短暂", "过渡", "误导"))
+
+def _mock_control_like_query(llm_state: dict[str, Any], schema_name: str, failure_mode: str | None = None) -> dict[str, Any]:
+    normalized_state = _normalize_mock_control_state(llm_state, schema_name)
+    business_profile = str(normalized_state.get("business_profile", "balanced"))
+    operator_text = str(normalized_state.get("operator_text", ""))
+    current_state = normalized_state.get("current_state", {})
+    history = normalized_state.get("history", normalized_state.get("recent_history", {}))
+    forecast = normalized_state.get("forecast", {})
+
+    latency_signal = any(
+        token in operator_text
+        for token in (
+            "AR",
+            "latency",
+            "low latency",
+            "latency-sensitive",
+            "keep the service close",
+            "distance-threshold violations",
+        )
+    )
+    stability_signal = any(
+        token in operator_text
+        for token in (
+            "stability",
+            "service stability",
+            "switching jitter",
+            "avoid frequent",
+            "temporary",
+            "temporary shift",
+        )
+    )
     high_mobility = bool(current_state.get("high_mobility_hint", False))
     moving_away = bool(current_state.get("predicted_moving_away", False))
     recent_migrations = int(history.get("migration_count_recent", 0))
+    average_distance_recent = float(history.get("average_service_distance_recent", current_state.get("distance_to_user", 0)))
+    conservative_profile = business_profile in {"delay_tolerant", "migration_sensitive", "high_stability_required"}
 
     objective_mode = "balanced"
     gamma = 0.9
     migration_weight = 1.0
     transmission_weight = 1.0
-    solver_mode = "mdp"
     reason_parts = []
 
     if business_profile in {"latency_sensitive"} or latency_signal:
         objective_mode = "latency_first"
-        gamma = 0.94 if high_mobility else 0.91
-        migration_weight = 0.8
-        transmission_weight = 1.45
-        solver_mode = "threshold" if high_mobility else "mdp"
+        gamma = 0.96 if high_mobility else 0.94
+        migration_weight = 0.7
+        transmission_weight = 1.6
         reason_parts.append("latency-oriented profile")
     if business_profile in {"migration_sensitive", "high_stability_required"} or stability_signal:
         if objective_mode == "latency_first":
@@ -203,26 +235,61 @@ def _mock_control_like_query(llm_state: dict[str, Any], failure_mode: str | None
             gamma = 0.88
             migration_weight = 1.1
             transmission_weight = 1.1
-            solver_mode = "mdp"
             reason_parts.append("conflicting stability signal balanced the request")
         else:
             objective_mode = "stability_first"
             gamma = 0.82 if recent_migrations >= 2 else 0.86
             migration_weight = 1.5
             transmission_weight = 0.85
-            solver_mode = "myopic" if recent_migrations >= 2 else "threshold"
             reason_parts.append("stability-oriented profile")
     if business_profile in {"delay_tolerant"} and objective_mode == "balanced":
-        gamma = 0.84
+        gamma = 0.86
         migration_weight = 1.2
-        transmission_weight = 0.9
-        solver_mode = "threshold"
+        transmission_weight = 0.98
         reason_parts.append("delay-tolerant profile")
+    if schema_name == "policy_advice":
+        forecast_trend = str(forecast.get("distance_trend", "stable"))
+        forecast_mobility = str(forecast.get("mobility_level", "low"))
+        forecast_stability = str(forecast.get("stability_risk", "low"))
+        if forecast_trend == "moving_away":
+            if conservative_profile and average_distance_recent < 1.5 and recent_migrations >= 2:
+                reason_parts.append("moving-away signal acknowledged but migration cooldown preserved")
+            else:
+                transmission_weight = max(transmission_weight, 1.15 if conservative_profile else 1.45)
+                gamma = max(gamma, 0.9 if conservative_profile else 0.94)
+                reason_parts.append("forecast indicates user moving away")
+        if forecast_mobility == "high":
+            gamma = max(gamma, 0.93)
+            reason_parts.append("forecast indicates high mobility")
+        if forecast_stability == "high":
+            if objective_mode == "latency_first":
+                migration_weight = max(migration_weight, 0.95)
+            else:
+                migration_weight = max(migration_weight, 1.25 if conservative_profile else 1.2)
+            reason_parts.append("forecast indicates elevated stability risk")
+
+    if conservative_profile and recent_migrations >= 2 and average_distance_recent <= 1.5:
+        gamma = min(gamma, 0.86 if business_profile == "delay_tolerant" else 0.87)
+        migration_weight = max(migration_weight, 1.3 if business_profile == "delay_tolerant" else 1.45)
+        transmission_weight = min(transmission_weight, 1.0 if business_profile == "delay_tolerant" else 0.95)
+        if objective_mode == "latency_first":
+            objective_mode = "balanced"
+        reason_parts.append("recent migration cooldown favored stability")
+
+    if business_profile == "high_stability_required" and average_distance_recent <= 1.5:
+        objective_mode = "stability_first"
+        gamma = min(gamma, 0.87)
+        migration_weight = max(migration_weight, 1.4)
+        transmission_weight = min(transmission_weight, 0.95)
+        reason_parts.append("stability profile enforced stronger migration budget")
+
     if moving_away and objective_mode == "balanced":
-        gamma = 0.92
-        transmission_weight = 1.2
-        solver_mode = "threshold" if high_mobility else "mdp"
-        reason_parts.append("user drifting away from service")
+        if conservative_profile and recent_migrations >= 2:
+            reason_parts.append("drift observed but conservative profile kept cooldown active")
+        else:
+            gamma = 0.92
+            transmission_weight = 1.2
+            reason_parts.append("user drifting away from service")
 
     if not reason_parts:
         reason_parts.append("balanced baseline response")
@@ -232,11 +299,10 @@ def _mock_control_like_query(llm_state: dict[str, Any], failure_mode: str | None
         "gamma": gamma,
         "migration_weight": migration_weight,
         "transmission_weight": transmission_weight,
-        "solver_mode": solver_mode,
         "reason": "; ".join(reason_parts),
     }
     if failure_mode == "invalid_enum":
-        response["solver_mode"] = "freeform"
+        response["objective_mode"] = "freeform"
     elif failure_mode == "missing_field":
         response.pop("gamma", None)
     elif failure_mode == "out_of_range":
@@ -253,7 +319,7 @@ def _mock_query(llm_state: dict[str, Any], schema_name: str, failure_mode: str |
     if schema_name == "forecast":
         return _mock_forecast_query(llm_state, failure_mode=failure_mode)
     if schema_name in {"control", "policy_advice"}:
-        return _mock_control_like_query(llm_state, failure_mode=failure_mode)
+        return _mock_control_like_query(llm_state, schema_name=schema_name, failure_mode=failure_mode)
     raise ValueError(f"Unsupported schema_name for mock backend: {schema_name}")
 
 
@@ -393,7 +459,7 @@ def query_llm(
     state: dict[str, Any] | None = None,
     failure_mode: str | None = None,
     backend: str = "mock",
-    model: str = "openai/gpt-5.3-chat",
+    model: str = "openai/gpt-5.4-mini",
     api_base: str = "https://openrouter.ai/api/v1",
     api_key_env: str = "OPENROUTER_API_KEY",
     timeout_sec: float = 30.0,

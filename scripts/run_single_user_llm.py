@@ -19,14 +19,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-dir", default=None)
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--show-progress", action="store_true")
     parser.add_argument("--use-1d", action="store_true")
-    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--llm-refresh-interval", type=int, default=5)
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--migrate-proportional", type=float, default=1.0)
     parser.add_argument("--llm-backend", default="mock")
-    parser.add_argument("--llm-model", default="openai/gpt-5.3-chat")
+    parser.add_argument("--llm-model", default="openai/gpt-5.4-mini")
     parser.add_argument("--llm-api-base", default="https://openrouter.ai/api/v1")
     parser.add_argument("--llm-api-key-env", default="OPENROUTER_API_KEY")
     parser.add_argument("--llm-timeout-sec", type=float, default=30.0)
@@ -53,6 +54,7 @@ def main() -> None:
         llm_api_key_env=args.llm_api_key_env,
         llm_timeout_sec=args.llm_timeout_sec,
         controller_mode=args.controller_mode,
+        show_progress=args.show_progress,
         business_profile=args.business_profile,
         operator_text=args.operator_text,
         num_states_left=args.num_states_left,

@@ -25,7 +25,6 @@ def build_llm_state(state: dict[str, Any], history: dict[str, Any], business_pro
             "recent_migrations": recent_migrations,
             "migration_count_recent": int(sum(recent_migrations)),
             "average_service_distance_recent": float(sum(recent_service_distances) / len(recent_service_distances)) if recent_service_distances else float(state["distance_to_user"]),
-            "previous_solver_mode": history.get("previous_solver_mode", "mdp"),
         },
         "business_profile": business_profile,
         "operator_text": operator_text or "",
@@ -38,7 +37,6 @@ def build_prompt(llm_state: dict[str, Any]) -> str:
         "gamma": "float in [0.7, 0.99]",
         "migration_weight": "float in [0.5, 1.8]",
         "transmission_weight": "float in [0.5, 1.8]",
-        "solver_mode": "threshold | myopic | mdp",
         "reason": "short explanation",
     }
     return (

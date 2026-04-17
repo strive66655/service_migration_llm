@@ -6,7 +6,7 @@ from time import perf_counter
 from typing import Any
 
 from .client import query_llm
-from .schema import DEFAULT_SAFE_CONTROL, SafeControlParams
+from .schema import DEFAULT_SAFE_CONTROL, FIXED_SOLVER_MODE, SafeControlParams
 from .validator import validate_llm_output
 
 _DISTANCE_TRENDS = {"moving_away", "stable", "approaching"}
@@ -20,7 +20,6 @@ class SharedControlState:
     recent_history: dict[str, Any]
     business_profile: str
     operator_text: str
-    previous_solver_mode: str
     recent_service_distances: list[int]
     recent_migrations: list[int]
 
@@ -41,7 +40,6 @@ class PolicyAdviceOutput:
     gamma: float
     migration_weight: float
     transmission_weight: float
-    solver_mode: str
     reason: str
     used_fallback: bool = False
     validation_notes: tuple[str, ...] = ()
@@ -70,7 +68,6 @@ def build_shared_control_state(state: dict[str, Any], history: dict[str, Any], b
             },
             business_profile=business_profile,
             operator_text=operator_text or "",
-            previous_solver_mode=str(history.get("previous_solver_mode", "mdp")),
             recent_service_distances=recent_service_distances,
             recent_migrations=recent_migrations,
         )
@@ -99,7 +96,6 @@ def build_policy_advisor_prompt(shared_control_state: dict[str, Any], forecast: 
         "gamma": "float in [0.7, 0.99]",
         "migration_weight": "float in [0.5, 1.8]",
         "transmission_weight": "float in [0.5, 1.8]",
-        "solver_mode": "threshold | myopic | mdp",
         "reason": "short explanation",
     }
     return (
@@ -150,36 +146,69 @@ def _coerce_policy_advice(output: dict[str, Any] | None) -> PolicyAdviceOutput:
         gamma=validated.gamma,
         migration_weight=validated.migration_weight,
         transmission_weight=validated.transmission_weight,
-        solver_mode=validated.solver_mode,
         reason=validated.reason,
         used_fallback=validated.used_fallback,
         validation_notes=validated.validation_notes,
     )
 
 
-def _apply_forecast_rules(base: dict[str, Any], forecast: ForecastOutput) -> dict[str, Any]:
+def _apply_forecast_rules(base: dict[str, Any], forecast: ForecastOutput, *, business_profile: str, operator_text: str) -> dict[str, Any]:
     draft = dict(base)
+    conservative_profile = business_profile in {"delay_tolerant", "migration_sensitive", "high_stability_required"}
+    latency_sensitive = business_profile == "latency_sensitive" or any(
+        token in operator_text
+        for token in (
+            "AR",
+            "latency",
+            "low latency",
+            "latency-sensitive",
+            "keep the service close",
+            "distance-threshold violations",
+        )
+    )
+    recent_migrations = int(draft.get("recent_history", 0))
+
+    if latency_sensitive:
+        draft["objective_mode"] = "latency_first"
+        draft["gamma"] = max(float(draft["gamma"]), 0.94)
+        draft["transmission_weight"] = max(float(draft["transmission_weight"]), 1.35)
+        draft["migration_weight"] = min(float(draft["migration_weight"]), 0.95)
+
     if forecast.distance_trend == "moving_away":
-        draft["transmission_weight"] = max(float(draft["transmission_weight"]), 1.15)
-        draft["gamma"] = max(float(draft["gamma"]), 0.9)
-        if forecast.mobility_level == "high":
-            draft["solver_mode"] = "threshold"
+        if conservative_profile and recent_migrations >= 2:
+            draft["transmission_weight"] = min(float(draft["transmission_weight"]), 1.0)
+        else:
+            floor = 1.45 if latency_sensitive else (1.1 if conservative_profile else 1.15)
+            gamma_floor = 0.94 if latency_sensitive else (0.89 if conservative_profile else 0.9)
+            draft["transmission_weight"] = max(float(draft["transmission_weight"]), floor)
+            draft["gamma"] = max(float(draft["gamma"]), gamma_floor)
     elif forecast.distance_trend == "approaching":
         draft["transmission_weight"] = min(float(draft["transmission_weight"]), 1.0)
 
     if forecast.mobility_level == "high":
-        draft["gamma"] = max(float(draft["gamma"]), 0.93)
-        draft["solver_mode"] = "threshold"
-    elif forecast.mobility_level == "low" and draft["solver_mode"] == "threshold":
-        draft["solver_mode"] = "mdp"
+        draft["gamma"] = max(float(draft["gamma"]), 0.95 if latency_sensitive else 0.93)
 
     if forecast.stability_risk == "high":
-        draft["migration_weight"] = max(float(draft["migration_weight"]), 1.2)
-        if draft["objective_mode"] == "latency_first":
+        if latency_sensitive:
+            draft["migration_weight"] = max(float(draft["migration_weight"]), 0.95)
+        else:
+            draft["migration_weight"] = max(float(draft["migration_weight"]), 1.25 if conservative_profile else 1.2)
+        if draft["objective_mode"] == "latency_first" and not latency_sensitive:
             draft["objective_mode"] = "balanced"
-        if draft["solver_mode"] == "myopic":
-            draft["solver_mode"] = "threshold"
 
+    if conservative_profile:
+        draft["gamma"] = min(float(draft["gamma"]), 0.87 if business_profile == "high_stability_required" else 0.86)
+        draft["migration_weight"] = max(float(draft["migration_weight"]), 1.35 if business_profile == "high_stability_required" else 1.2)
+        draft["transmission_weight"] = min(float(draft["transmission_weight"]), 0.95 if business_profile == "high_stability_required" else 1.0)
+        if recent_migrations >= 2:
+            draft["migration_weight"] = max(float(draft["migration_weight"]), 1.45 if business_profile == "high_stability_required" else 1.3)
+            draft["gamma"] = min(float(draft["gamma"]), 0.86)
+        if business_profile == "high_stability_required":
+            draft["objective_mode"] = "stability_first"
+        elif draft["objective_mode"] == "latency_first":
+            draft["objective_mode"] = "balanced"
+
+    draft.pop("recent_history", None)
     return draft
 
 
@@ -189,11 +218,9 @@ def _agreement_level(forecast: ForecastOutput, advice: PolicyAdviceOutput) -> st
         score += 1
     if forecast.stability_risk == "high" and advice.migration_weight >= 1.1:
         score += 1
-    if forecast.mobility_level == "high" and advice.solver_mode == "threshold":
-        score += 1
-    if score >= 3:
+    if score >= 2:
         return "high"
-    if score == 2:
+    if score == 1:
         return "medium"
     return "low"
 
@@ -246,16 +273,8 @@ def query_multi_agent_control(
         policy_raw = query_llm(
             policy_prompt,
             state={
-                "current_state": shared_control_state["current_state"],
-                "history": {
-                    "recent_service_distances": shared_control_state["recent_service_distances"],
-                    "recent_migrations": shared_control_state["recent_migrations"],
-                    "migration_count_recent": shared_control_state["recent_history"]["migration_count_recent"],
-                    "average_service_distance_recent": shared_control_state["recent_history"]["average_service_distance_recent"],
-                    "previous_solver_mode": shared_control_state["previous_solver_mode"],
-                },
-                "business_profile": shared_control_state["business_profile"],
-                "operator_text": shared_control_state["operator_text"],
+                "shared_control_state": shared_control_state,
+                "forecast": asdict(forecast),
             },
             failure_mode=failure_mode,
             backend=backends.get("policy_advisor", backend),
@@ -276,13 +295,15 @@ def query_multi_agent_control(
             "gamma": policy_advice.gamma,
             "migration_weight": policy_advice.migration_weight,
             "transmission_weight": policy_advice.transmission_weight,
-            "solver_mode": policy_advice.solver_mode,
             "reason": policy_advice.reason,
+            "recent_history": shared_control_state["recent_history"]["migration_count_recent"],
         },
         forecast,
+        business_profile=shared_control_state["business_profile"],
+        operator_text=shared_control_state["operator_text"],
     )
     final_control = validate_llm_output(draft_control, DEFAULT_SAFE_CONTROL)
-    fallback_notes = [*forecast.validation_notes, *policy_advice.validation_notes, *final_control.validation_notes]
+    fallback_notes = tuple(dict.fromkeys([*forecast.validation_notes, *policy_advice.validation_notes, *final_control.validation_notes]))
     fallback_used = bool(fallback_notes)
 
     return {
@@ -292,8 +313,8 @@ def query_multi_agent_control(
         "policy_advisor_raw_output": policy_raw,
         "policy_advisor_output": asdict(policy_advice),
         "draft_control": draft_control,
-        "final_safe_control": asdict(final_control),
-        "validation_notes": list(final_control.validation_notes),
+        "final_safe_control": {**asdict(final_control), "solver_mode": FIXED_SOLVER_MODE},
+        "validation_notes": list(fallback_notes),
         "fallback_used": fallback_used,
         "fallback_reason": ", ".join(fallback_notes) if fallback_notes else "",
         "final_decision_source": _decision_source(forecast, policy_raw, final_control),

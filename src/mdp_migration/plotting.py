@@ -271,20 +271,15 @@ def plot_single_user_llm_parameter_trace(results: dict, output_dir: str | None =
     gamma = [decision["validated_control"]["gamma"] for decision in decisions]
     migration_weight = [decision["validated_control"]["migration_weight"] for decision in decisions]
     transmission_weight = [decision["validated_control"]["transmission_weight"] for decision in decisions]
-    solver_mode_map = {"myopic": 0, "threshold": 1, "mdp": 2}
-    solver_values = [solver_mode_map.get(decision["validated_control"]["solver_mode"], -1) for decision in decisions]
 
-    fig, axes = plt.subplots(4, 1, figsize=(10, 10), sharex=True, constrained_layout=True)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True, constrained_layout=True)
     axes[0].plot(steps, gamma, marker="o", color="#2563eb")
     axes[0].set_ylabel("gamma")
     axes[1].plot(steps, migration_weight, marker="o", color="#d97706")
     axes[1].set_ylabel("migration weight")
     axes[2].plot(steps, transmission_weight, marker="o", color="#059669")
     axes[2].set_ylabel("transmission weight")
-    axes[3].step(steps, solver_values, where="mid", color="#7c3aed")
-    axes[3].set_yticks([0, 1, 2], ["myopic", "threshold", "mdp"])
-    axes[3].set_ylabel("solver")
-    axes[3].set_xlabel("Decision Refresh Step")
+    axes[2].set_xlabel("Decision Refresh Step")
     fig.suptitle("LLM Control Parameter Evolution")
     if output_dir:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -305,10 +300,9 @@ def plot_single_user_llm_multi_agent_diagnostics(results: dict, output_dir: str 
     steps = [decision["step"] for decision in multi_agent_decisions]
     agreement_map = {"low": 0, "medium": 1, "high": 2}
     decision_source_map = {
-        "single_agent_direct": 0,
-        "multi_agent_merged": 1,
-        "fallback_partial": 2,
-        "fallback_default": 3,
+        "multi_agent_merged": 0,
+        "fallback_partial": 1,
+        "fallback_default": 2,
     }
     agreement_values = [agreement_map.get(decision.get("agent_agreement", "low"), 0) for decision in multi_agent_decisions]
     fallback_values = [1 if decision.get("fallback_used") else 0 for decision in multi_agent_decisions]
@@ -325,7 +319,7 @@ def plot_single_user_llm_multi_agent_diagnostics(results: dict, output_dir: str 
     axes[0].set_ylabel("Agreement")
 
     axes[1].step(steps, decision_source_values, where="mid", color="#7c3aed")
-    axes[1].set_yticks([0, 1, 2, 3], ["single", "merged", "partial", "default"])
+    axes[1].set_yticks([0, 1, 2], ["merged", "partial", "default"])
     axes[1].set_ylabel("Decision Source")
 
     axes[2].step(steps, fallback_values, where="mid", color="#dc2626", label="fallback")

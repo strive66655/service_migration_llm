@@ -1,12 +1,15 @@
 ﻿from __future__ import annotations
 
+import sys
 from dataclasses import asdict, dataclass
+from time import perf_counter
 from typing import Any
 
 import numpy as np
 
 from .core import CostParams, PolicyResult, build_1d_transition_matrix, build_random_walk_2d_transition_matrix, evaluate_policy, hex_grid_coordinates, hop_distance_matrix, map_threshold_actions_to_2d, reduced_chain_from_stay_probability
-from .llm import DEFAULT_SAFE_CONTROL, apply_control_params, build_llm_state, build_prompt, build_shared_control_state, query_llm, query_multi_agent_control, validate_llm_output
+from .llm import DEFAULT_SAFE_CONTROL, SafeControlParams, apply_control_params, build_llm_state, build_prompt, build_shared_control_state, query_llm, query_multi_agent_control, validate_llm_output
+from .llm.schema import FIXED_SOLVER_MODE
 from .policies import AlwaysMigratePolicy, ModifiedPolicyIterationPolicy, MyopicPolicy, NeverMigratePolicy, PolicyContext, PolicyIterationPolicy
 
 
@@ -26,6 +29,7 @@ class SingleUserLLMConfig:
     llm_api_key_env: str = "OPENROUTER_API_KEY"
     llm_timeout_sec: float = 30.0
     controller_mode: str = "single_agent"
+    show_progress: bool = False
     business_profile: str = "balanced"
     operator_text: str = ""
     agent_models: dict[str, str] | None = None
@@ -206,6 +210,7 @@ def _single_agent_diagnostics(
     shared_control_state: dict[str, Any],
     llm_raw: dict[str, Any] | None,
     llm_control: Any,
+    latency_ms: float,
 ) -> dict[str, Any]:
     validation_notes = list(llm_control.validation_notes)
     if llm_raw is None:
@@ -221,16 +226,67 @@ def _single_agent_diagnostics(
         "policy_advisor_raw_output": None,
         "policy_advisor_output": None,
         "draft_control": llm_raw,
-        "final_safe_control": asdict(llm_control),
+        "final_safe_control": _control_to_dict(llm_control),
         "validation_notes": validation_notes,
         "fallback_used": bool(validation_notes),
         "fallback_reason": ", ".join(validation_notes) if validation_notes else "",
         "final_decision_source": final_decision_source,
         "agent_agreement": "high",
         "agent_metrics": {
-            "single_agent": {"latency_ms": 0.0, "call_count": 1},
+            "single_agent": {"latency_ms": latency_ms, "call_count": 1},
+            "forecaster": {"latency_ms": 0.0, "call_count": 0},
+            "policy_advisor": {"latency_ms": 0.0, "call_count": 0},
+            "safety_arbiter": {"latency_ms": 0.0, "call_count": 0},
         },
     }
+
+
+def _with_fixed_solver(control: SafeControlParams) -> SafeControlParams:
+    return SafeControlParams(
+        objective_mode=control.objective_mode,
+        gamma=control.gamma,
+        migration_weight=control.migration_weight,
+        transmission_weight=control.transmission_weight,
+        reason=control.reason,
+        used_fallback=control.used_fallback,
+        validation_notes=control.validation_notes,
+    )
+
+
+def _control_to_dict(control: SafeControlParams) -> dict[str, Any]:
+    payload = asdict(control)
+    payload["solver_mode"] = FIXED_SOLVER_MODE
+    return payload
+
+
+def _refresh_schedule(config: SingleUserLLMConfig) -> list[int]:
+    return list(range(0, config.num_steps, max(config.llm_refresh_interval, 1)))
+
+
+def _requests_per_refresh(config: SingleUserLLMConfig) -> int:
+    return 2 if config.controller_mode == "multi_agent" else 1
+
+
+def _print_progress(
+    *,
+    step: int,
+    total_steps: int,
+    refresh_count: int,
+    total_refreshes: int,
+    request_count: int,
+    total_requests: int,
+    controller_mode: str,
+) -> None:
+    width = 24
+    ratio = step / max(total_steps, 1)
+    filled = int(ratio * width)
+    bar = "#" * filled + "-" * (width - filled)
+    print(
+        f"\r[{bar}] step {step}/{total_steps} | refresh {refresh_count}/{total_refreshes} | requests {request_count}/{total_requests} | mode={controller_mode}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
@@ -264,15 +320,19 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
 
     llm_control = DEFAULT_SAFE_CONTROL
     llm_cost_params = apply_control_params(base_cost_params, llm_control)
-    llm_policy_actions = _solve_policy_actions(env, llm_cost_params, llm_control.solver_mode).actions
+    llm_policy_actions = _solve_policy_actions(env, llm_cost_params, FIXED_SOLVER_MODE).actions
     llm_history: dict[str, Any] = {
         "recent_service_distances": [],
         "recent_migrations": [],
-        "previous_solver_mode": llm_control.solver_mode,
     }
     llm_decisions: list[dict[str, Any]] = []
     draws = np.random.default_rng(config.sim_seed + 97).random(config.num_steps)
     weights = config.evaluation_weights
+    total_refreshes = len(_refresh_schedule(config))
+    requests_per_refresh = _requests_per_refresh(config)
+    total_requests = total_refreshes * requests_per_refresh
+    completed_refreshes = 0
+    completed_requests = 0
 
     for step in range(config.num_steps):
         if step % max(config.llm_refresh_interval, 1) == 0:
@@ -290,7 +350,8 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
                     agent_models=config.agent_models,
                     agent_backends=config.agent_backends,
                 )
-                llm_control = validate_llm_output(diagnostics["final_safe_control"], DEFAULT_SAFE_CONTROL)
+                llm_control = _with_fixed_solver(SafeControlParams(**{k: v for k, v in diagnostics["final_safe_control"].items() if k != "solver_mode"}))
+                completed_requests += requests_per_refresh
             else:
                 llm_state = build_llm_state(
                     {
@@ -302,12 +363,12 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
                     {
                         "recent_service_distances": shared_control_state["recent_service_distances"],
                         "recent_migrations": shared_control_state["recent_migrations"],
-                        "previous_solver_mode": shared_control_state["previous_solver_mode"],
                     },
                     config.business_profile,
                     config.operator_text,
                 )
                 prompt = build_prompt(llm_state)
+                llm_started = perf_counter()
                 try:
                     llm_raw = query_llm(
                         prompt,
@@ -321,17 +382,19 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
                     )
                 except TimeoutError:
                     llm_raw = None
+                llm_latency_ms = (perf_counter() - llm_started) * 1000.0
                 llm_control = validate_llm_output(llm_raw, DEFAULT_SAFE_CONTROL)
-                diagnostics = _single_agent_diagnostics(shared_control_state, llm_raw, llm_control)
+                diagnostics = _single_agent_diagnostics(shared_control_state, llm_raw, llm_control, llm_latency_ms)
+                completed_requests += requests_per_refresh
             llm_cost_params = apply_control_params(base_cost_params, llm_control)
-            llm_policy_actions = _solve_policy_actions(env, llm_cost_params, llm_control.solver_mode).actions
-            llm_history["previous_solver_mode"] = llm_control.solver_mode
+            llm_policy_actions = _solve_policy_actions(env, llm_cost_params, FIXED_SOLVER_MODE).actions
+            completed_refreshes += 1
             llm_decisions.append(
                 {
                     "step": step,
                     "controller_mode": config.controller_mode,
                     **diagnostics,
-                    "validated_control": asdict(llm_control),
+                    "validated_control": _control_to_dict(llm_control),
                 }
             )
 
@@ -368,6 +431,20 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
             if name == "llm_meta_mdp":
                 llm_history["recent_service_distances"] = (llm_history["recent_service_distances"] + [service_distance])[-5:]
                 llm_history["recent_migrations"] = (llm_history["recent_migrations"] + [migration_flag])[-5:]
+
+        if config.show_progress:
+            _print_progress(
+                step=step + 1,
+                total_steps=config.num_steps,
+                refresh_count=completed_refreshes,
+                total_refreshes=total_refreshes,
+                request_count=completed_requests,
+                total_requests=total_requests,
+                controller_mode=config.controller_mode,
+            )
+
+    if config.show_progress:
+        print(file=sys.stderr)
 
     return {
         "config": asdict(config),

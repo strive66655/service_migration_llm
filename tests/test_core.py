@@ -104,12 +104,10 @@ class CoreTests(unittest.TestCase):
                 "gamma": 1.4,
                 "migration_weight": -2,
                 "transmission_weight": 3,
-                "solver_mode": "freeform",
                 "reason": "test",
             },
             DEFAULT_SAFE_CONTROL,
         )
-        self.assertEqual(validated.solver_mode, "mdp")
         self.assertAlmostEqual(validated.gamma, 0.99)
         self.assertAlmostEqual(validated.migration_weight, 0.5)
         self.assertTrue(validated.used_fallback)
@@ -117,19 +115,19 @@ class CoreTests(unittest.TestCase):
     def test_llm_prompt_and_query(self) -> None:
         llm_state = build_llm_state(
             {"state_index": 3, "service_index": 3, "distance_to_user": 2, "recent_direction": 1},
-            {"recent_service_distances": [1, 2], "recent_migrations": [0, 1], "previous_solver_mode": "mdp"},
+            {"recent_service_distances": [1, 2], "recent_migrations": [0, 1]},
             "latency_sensitive",
             "当前业务对时延敏感，可接受必要迁移",
         )
         prompt = build_prompt(llm_state)
         raw = query_llm(prompt, state=llm_state)
         self.assertEqual(raw["objective_mode"], "latency_first")
-        self.assertIn("solver_mode", raw)
+        self.assertNotIn("solver_mode", raw)
 
     def test_multi_agent_forecast_schema_and_merge(self) -> None:
         shared_state = build_shared_control_state(
             {"state_index": 3, "service_index": 3, "distance_to_user": 3, "recent_direction": 2},
-            {"recent_service_distances": [1, 1], "recent_migrations": [1, 1], "previous_solver_mode": "mdp"},
+            {"recent_service_distances": [1, 1], "recent_migrations": [1, 1]},
             "latency_sensitive",
             "latency critical",
         )
@@ -142,7 +140,7 @@ class CoreTests(unittest.TestCase):
     def test_multi_agent_forecast_invalid_enum_partially_falls_back(self) -> None:
         shared_state = build_shared_control_state(
             {"state_index": 2, "service_index": 2, "distance_to_user": 2, "recent_direction": 0},
-            {"recent_service_distances": [2], "recent_migrations": [0], "previous_solver_mode": "mdp"},
+            {"recent_service_distances": [2], "recent_migrations": [0]},
             "balanced",
             "",
         )
@@ -150,6 +148,31 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(result["fallback_used"])
         self.assertEqual(result["final_decision_source"], "fallback_partial")
         self.assertEqual(result["forecaster_output"]["mobility_level"], "low")
+        self.assertTrue(result["validation_notes"])
+        self.assertIn("mobility_level_fallback", result["validation_notes"])
+
+    def test_policy_advisor_mock_accepts_shared_state_protocol(self) -> None:
+        shared_state = build_shared_control_state(
+            {"state_index": 3, "service_index": 3, "distance_to_user": 3, "recent_direction": 2},
+            {"recent_service_distances": [1, 1], "recent_migrations": [1, 1]},
+            "latency_sensitive",
+            "latency critical",
+        )
+        result = query_multi_agent_control(shared_state, backend="mock")
+        self.assertGreaterEqual(result["policy_advisor_output"]["transmission_weight"], 1.45)
+        self.assertEqual(result["final_safe_control"]["solver_mode"], "mdp")
+
+    def test_latency_profile_is_not_pulled_back_by_stability_rule(self) -> None:
+        shared_state = build_shared_control_state(
+            {"state_index": 4, "service_index": 4, "distance_to_user": 4, "recent_direction": 2},
+            {"recent_service_distances": [1, 2, 3], "recent_migrations": [1, 1, 1]},
+            "latency_sensitive",
+            "latency critical AR traffic",
+        )
+        result = query_multi_agent_control(shared_state, backend="mock")
+        self.assertEqual(result["final_safe_control"]["objective_mode"], "latency_first")
+        self.assertGreaterEqual(result["final_safe_control"]["transmission_weight"], 1.45)
+        self.assertLessEqual(result["final_safe_control"]["migration_weight"], 0.95)
 
     def test_apply_control_params_changes_weights(self) -> None:
         base = CostParams(0.9, 0.8, 2.0, -1.0, 1.0, -0.5)
@@ -161,7 +184,6 @@ class CoreTests(unittest.TestCase):
                     "gamma": 0.8,
                     "migration_weight": 1.5,
                     "transmission_weight": 0.75,
-                    "solver_mode": "threshold",
                     "reason": "stable",
                 }
             ),
@@ -187,6 +209,8 @@ class CoreTests(unittest.TestCase):
         self.assertIn("evaluation_metric_definition", result)
         self.assertIn("evaluation_cost", result["method_summaries"]["llm_meta_mdp"])
         self.assertGreater(len(result["llm_decisions"]), 0)
+        self.assertIn("forecaster", result["llm_decisions"][0]["agent_metrics"])
+        self.assertIn("single_agent", result["llm_decisions"][0]["agent_metrics"])
 
     def test_single_user_llm_timeout_falls_back(self) -> None:
         result = run_single_user_llm_loop(

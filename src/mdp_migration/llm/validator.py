@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from .schema import DEFAULT_SAFE_CONTROL, OBJECTIVE_MODES, SOLVER_MODES, SafeControlParams
+from .schema import DEFAULT_SAFE_CONTROL, FIXED_SOLVER_MODE, OBJECTIVE_MODES, SafeControlParams
 
 
 def _clip(value: Any, lower: float, upper: float, fallback: float) -> tuple[float, str | None]:
@@ -30,10 +30,8 @@ def validate_llm_output(output: dict[str, Any] | None, fallback: SafeControlPara
         notes.append("objective_mode_fallback")
         objective_mode = safe_fallback.objective_mode
 
-    solver_mode = str(output.get("solver_mode", safe_fallback.solver_mode))
-    if solver_mode not in SOLVER_MODES:
-        notes.append("solver_mode_fallback")
-        solver_mode = safe_fallback.solver_mode
+    if "solver_mode" in output and str(output.get("solver_mode")) != FIXED_SOLVER_MODE:
+        notes.append("solver_mode_locked")
 
     gamma, gamma_note = _clip(output.get("gamma", safe_fallback.gamma), 0.7, 0.99, safe_fallback.gamma)
     if gamma_note is not None:
@@ -54,7 +52,6 @@ def validate_llm_output(output: dict[str, Any] | None, fallback: SafeControlPara
         gamma=gamma,
         migration_weight=migration_weight,
         transmission_weight=transmission_weight,
-        solver_mode=solver_mode,
         reason=reason,
         used_fallback=used_fallback,
         validation_notes=tuple(notes),

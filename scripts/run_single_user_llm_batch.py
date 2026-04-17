@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 from mdp_migration.io import save_json
 from mdp_migration.plotting import (
     plot_single_user_llm_batch_results,
+    plot_single_user_llm_multi_agent_diagnostics,
     plot_single_user_llm_parameter_trace,
     plot_single_user_llm_results,
     plot_single_user_llm_tradeoff,
@@ -22,6 +23,52 @@ from mdp_migration.single_user_llm import SingleUserLLMConfig, run_single_user_l
 PRIMARY_METRICS = ["evaluation_cost", "avg_service_distance", "avg_migration_count", "jitter_ratio"]
 AUX_METRICS = ["distance_violation_ratio", "avg_migration_distance"]
 EXPLANATORY_METRICS = ["run_cost"]
+SCENARIO_REVIEW_GUIDES = {
+    "balanced": {
+        "primary_metrics": ["avg_service_distance", "avg_migration_count"],
+        "aux_metrics": ["evaluation_cost"],
+        "judgement_focus": "Check whether service distance and migration count reach a reasonable trade-off.",
+    },
+    "latency": {
+        "primary_metrics": ["avg_service_distance", "distance_violation_ratio"],
+        "aux_metrics": ["avg_migration_count"],
+        "judgement_focus": "Check whether service stays close to the user and distance violations remain low; extra migrations are acceptable but should stay controlled.",
+    },
+    "stability": {
+        "primary_metrics": ["jitter_ratio", "avg_migration_count"],
+        "aux_metrics": ["avg_service_distance"],
+        "judgement_focus": "Check whether switching jitter and migration frequency are suppressed; service distance can worsen slightly but not too much.",
+    },
+    "delay_tolerant": {
+        "primary_metrics": ["avg_migration_count", "run_cost"],
+        "aux_metrics": ["avg_service_distance"],
+        "judgement_focus": "Check whether migration count and system cost are reduced without over-migrating just to keep the service closer.",
+    },
+    "conflict": {
+        "primary_metrics": ["avg_service_distance", "avg_migration_count", "jitter_ratio"],
+        "aux_metrics": ["evaluation_cost"],
+        "judgement_focus": "Check whether distance, migration count, and jitter achieve a balanced compromise rather than optimizing only one metric.",
+    },
+}
+
+
+def _print_batch_progress(
+    *,
+    completed_runs: int,
+    total_runs: int,
+    scenario_name: str,
+    seed: int,
+) -> None:
+    width = 24
+    ratio = completed_runs / max(total_runs, 1)
+    filled = int(ratio * width)
+    bar = "#" * filled + "-" * (width - filled)
+    print(
+        f"\r[{bar}] batch {completed_runs}/{total_runs} | scenario={scenario_name} | seed={seed}",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _scenario_configs(
@@ -51,32 +98,32 @@ def _scenario_configs(
     scenarios = {
         "balanced": {
             "business_profile": "balanced",
-            "operator_text": "\u5728\u4fdd\u8bc1\u603b\u4f53\u670d\u52a1\u8d28\u91cf\u7684\u524d\u63d0\u4e0b\uff0c\u517c\u987e\u670d\u52a1\u8ddd\u79bb\u4e0e\u8fc1\u79fb\u5f00\u9500\u3002",
+            "operator_text": "Maintain overall service quality while balancing shorter service distance with controlled migration frequency.",
             "failure_mode": None,
         },
         "latency": {
             "business_profile": "latency_sensitive",
-            "operator_text": "\u5f53\u524d\u4e1a\u52a1\u4e3a AR \u5bfc\u822a\u4f1a\u8bdd\uff0c\u4f18\u5148\u4fdd\u8bc1\u4f4e\u65f6\u5ef6\uff0c\u53ef\u63a5\u53d7\u5fc5\u8981\u8fc1\u79fb\u3002",
+            "operator_text": "This is an AR navigation session. Prioritize low latency, keep the service close to the user, and keep distance-threshold violations low. Necessary migrations are acceptable but must remain controlled.",
             "failure_mode": None,
         },
         "stability": {
             "business_profile": "high_stability_required",
-            "operator_text": "\u5f53\u524d\u4f4d\u7f6e\u53ef\u80fd\u53ea\u662f\u77ed\u6682\u504f\u79fb\uff0c\u4f18\u5148\u4fdd\u6301\u670d\u52a1\u7a33\u5b9a\uff0c\u907f\u514d\u9891\u7e41\u8fc1\u79fb\u3002",
+            "operator_text": "The current position shift may be temporary. Prioritize service stability, suppress switching jitter and migration frequency, and allow a modest distance trade-off if needed.",
             "failure_mode": None,
         },
         "delay_tolerant": {
             "business_profile": "delay_tolerant",
-            "operator_text": "\u5f53\u524d\u4e1a\u52a1\u5bf9\u65f6\u5ef6\u4e0d\u654f\u611f\uff0c\u4f18\u5148\u51cf\u5c11\u8fc1\u79fb\u5e26\u6765\u7684\u989d\u5916\u5f00\u9500\u3002",
+            "operator_text": "This workload is delay tolerant. Prioritize fewer migrations and lower system cost, and avoid over-migrating just to keep the service slightly closer.",
             "failure_mode": None,
         },
         "conflict": {
-            "business_profile": "latency_sensitive",
-            "operator_text": "\u5f53\u524d\u4e1a\u52a1\u5bf9\u65f6\u5ef6\u654f\u611f\uff0c\u4f46\u82e5\u4f4d\u7f6e\u504f\u79fb\u53ea\u662f\u77ed\u65f6\u73b0\u8c61\uff0c\u5e94\u907f\u514d\u65e0\u610f\u4e49\u8fc1\u79fb\u3002",
+            "business_profile": "balanced",
+            "operator_text": "This scenario contains conflicting goals: keep service distance low, avoid too many migrations, and suppress switching jitter. Seek a balanced compromise across all three.",
             "failure_mode": None,
         },
         "timeout_fallback": {
             "business_profile": "latency_sensitive",
-            "operator_text": "\u5f53\u524d\u4e1a\u52a1\u4e3a AR \u5bfc\u822a\u4f1a\u8bdd\uff0c\u4f18\u5148\u4fdd\u8bc1\u4f4e\u65f6\u5ef6\uff0c\u53ef\u63a5\u53d7\u5fc5\u8981\u8fc1\u79fb\u3002",
+            "operator_text": "This is an AR navigation session. Prioritize low latency, keep the service close to the user, and keep distance-threshold violations low. Necessary migrations are acceptable but must remain controlled.",
             "failure_mode": "timeout",
         },
     }
@@ -89,7 +136,11 @@ def _scenario_configs(
 
     expanded = {}
     for name, override in scenarios.items():
-        expanded[name] = [SingleUserLLMConfig(sim_seed=seed, **base, **override) for seed in seeds]
+        review_guide = SCENARIO_REVIEW_GUIDES.get(name)
+        if review_guide is not None:
+            override["review_guide"] = review_guide
+        config_override = {key: value for key, value in override.items() if key != "review_guide"}
+        expanded[name] = [SingleUserLLMConfig(sim_seed=seed, **base, **config_override) for seed in seeds]
     return expanded, scenarios
 
 
@@ -172,12 +223,13 @@ def _write_markdown_tables(aggregated: dict, output_path: Path) -> None:
     scenario_md = [
         "# Scenario Definitions",
         "",
-        "| Scenario | Business Profile | Operator Text | Failure Mode |",
-        "| --- | --- | --- | --- |",
+        "| Scenario | Business Profile | Primary Metrics | Auxiliary Metrics | Judgement Focus | Operator Text | Failure Mode |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for scenario_name, definition in aggregated["scenario_definitions"].items():
+        review_guide = definition.get("review_guide", {})
         scenario_md.append(
-            f"| {scenario_name} | {definition['business_profile']} | {definition['operator_text']} | {definition['failure_mode'] or 'none'} |"
+            f"| {scenario_name} | {definition['business_profile']} | {', '.join(review_guide.get('primary_metrics', []))} | {', '.join(review_guide.get('aux_metrics', []))} | {review_guide.get('judgement_focus', '')} | {definition['operator_text']} | {definition['failure_mode'] or 'none'} |"
         )
 
     (output_path / "single_user_llm_metrics_table.md").write_text("\n".join(metrics_md), encoding="utf-8")
@@ -209,16 +261,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-dir", default="outputs/single_user_llm_batch")
     parser.add_argument("--use-1d", action="store_true")
-    parser.add_argument("--steps", type=int, default=120)
-    parser.add_argument("--llm-refresh-interval", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--llm-refresh-interval", type=int, default=10)
     parser.add_argument("--controller-mode", choices=["single_agent", "multi_agent"], default="single_agent")
     parser.add_argument("--llm-backend", default="mock")
-    parser.add_argument("--llm-model", default="openai/gpt-5.3-chat")
+    parser.add_argument("--llm-model", default="openai/gpt-5.4-mini")
     parser.add_argument("--llm-api-base", default="https://openrouter.ai/api/v1")
     parser.add_argument("--llm-api-key-env", default="OPENROUTER_API_KEY")
     parser.add_argument("--llm-timeout-sec", type=float, default=30.0)
     parser.add_argument("--seeds", type=int, nargs="*", default=[1, 2, 3, 4, 5])
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument("--show-progress", action="store_true")
     parser.add_argument("--scenarios", nargs="*", default=None)
     parser.add_argument("--merge-into", default=None)
     args = parser.parse_args()
@@ -250,15 +303,31 @@ def main() -> None:
         "scenarios": {},
     }
     representative_result = None
+    total_runs = sum(len(configs) for configs in scenario_runs.values())
+    completed_runs = 0
     for name, configs in scenario_runs.items():
-        runs = [run_single_user_llm_loop(config) for config in configs]
+        runs = []
+        for config in configs:
+            config.show_progress = args.show_progress
+            run = run_single_user_llm_loop(config)
+            runs.append(run)
+            completed_runs += 1
+            if args.show_progress:
+                _print_batch_progress(
+                    completed_runs=completed_runs,
+                    total_runs=total_runs,
+                    scenario_name=name,
+                    seed=config.sim_seed,
+                )
         aggregated["scenarios"][name] = {
             "method_summaries": _average_summaries(runs),
             "method_summary_std": _summary_std(runs),
             "evaluation_metric_definition": runs[0]["evaluation_metric_definition"],
         }
-        if name == "latency":
+        if representative_result is None or name == "latency":
             representative_result = runs[0]
+    if args.show_progress:
+        print(file=sys.stderr)
 
     save_path = Path(args.save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
@@ -281,6 +350,7 @@ def main() -> None:
         if representative_result is not None:
             plot_single_user_llm_results(representative_result, str(save_path))
             plot_single_user_llm_parameter_trace(representative_result, str(save_path))
+            plot_single_user_llm_multi_agent_diagnostics(representative_result, str(save_path))
 
 
 if __name__ == "__main__":
