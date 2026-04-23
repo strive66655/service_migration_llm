@@ -7,6 +7,23 @@ import numpy as np
 from matplotlib.ticker import MaxNLocator
 
 
+_SINGLE_SUMMARY_METRICS = [
+    ("evaluation_cost", "Evaluation Cost", "#3b82f6"),
+    ("avg_service_distance", "Service Distance", "#10b981"),
+    ("avg_migration_distance", "Migration Distance", "#8b5cf6"),
+    ("avg_migration_count", "Migration Count", "#f59e0b"),
+    ("jitter_ratio", "Jitter Ratio", "#ef4444"),
+]
+
+_BATCH_SUMMARY_METRICS = [
+    ("evaluation_cost", "Evaluation Cost"),
+    ("avg_service_distance", "Service Distance"),
+    ("avg_migration_distance", "Migration Distance"),
+    ("avg_migration_count", "Migration Count"),
+    ("jitter_ratio", "Jitter Ratio"),
+]
+
+
 def _finite_series_values(series: list[np.ndarray]) -> np.ndarray:
     values = np.concatenate([np.asarray(s, dtype=float).reshape(-1) for s in series])
     return values[np.isfinite(values)]
@@ -139,31 +156,23 @@ def plot_single_user_llm_results(results: dict, output_dir: str | None = None) -
     method_summaries = results["method_summaries"]
     methods = list(method_summaries.keys())
     labels = [m.replace("_", "\n") for m in methods]
-    eval_cost = [method_summaries[m]["evaluation_cost"] for m in methods]
-    service_distance = [method_summaries[m]["avg_service_distance"] for m in methods]
-    migration_count = [method_summaries[m]["avg_migration_count"] for m in methods]
-    jitter_ratio = [method_summaries[m]["jitter_ratio"] for m in methods]
-
-    fig1, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
+    fig1, axes = plt.subplots(3, 3, figsize=(14, 11), constrained_layout=True)
     axes = axes.reshape(-1)
-    series = [
-        ("Evaluation Cost", eval_cost, "#3b82f6"),
-        ("Avg Service Distance", service_distance, "#10b981"),
-        ("Avg Migration Count", migration_count, "#f59e0b"),
-        ("Jitter Ratio", jitter_ratio, "#ef4444"),
-    ]
     x = np.arange(len(methods))
-    for ax, (title, values, color) in zip(axes, series):
+    for ax, (metric, title, color) in zip(axes, _SINGLE_SUMMARY_METRICS):
+        values = [method_summaries[m][metric] for m in methods]
         ax.bar(x, values, color=color)
         ax.set_title(title)
         ax.set_xticks(x, labels)
         ax.tick_params(axis="x", labelrotation=20)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+    for ax in axes[len(_SINGLE_SUMMARY_METRICS) :]:
+        ax.axis("off")
 
     llm_trace = results["method_traces"]["llm_meta_mdp"]
     baseline_trace = results["method_traces"]["mdp_baseline"]
     steps = np.arange(len(llm_trace["service_distance"]))
-    fig2, axes2 = plt.subplots(2, 1, figsize=(11, 8), sharex=True, constrained_layout=True)
+    fig2, axes2 = plt.subplots(3, 1, figsize=(11, 10), sharex=True, constrained_layout=True)
     axes2[0].plot(steps, baseline_trace["service_distance"], label="MDP baseline", color="#6366f1")
     axes2[0].plot(steps, llm_trace["service_distance"], label="LLM-Meta-MDP", color="#dc2626")
     axes2[0].set_ylabel("Service Distance")
@@ -171,9 +180,14 @@ def plot_single_user_llm_results(results: dict, output_dir: str | None = None) -
 
     axes2[1].step(steps, baseline_trace["migration_flag"], where="mid", label="MDP baseline", color="#6366f1")
     axes2[1].step(steps, llm_trace["migration_flag"], where="mid", label="LLM-Meta-MDP", color="#dc2626")
-    axes2[1].set_xlabel("Step")
     axes2[1].set_ylabel("Migration Flag")
     axes2[1].legend()
+
+    axes2[2].plot(steps, baseline_trace["evaluation_cost"], label="MDP baseline", color="#6366f1")
+    axes2[2].plot(steps, llm_trace["evaluation_cost"], label="LLM-Meta-MDP", color="#dc2626")
+    axes2[2].set_xlabel("Step")
+    axes2[2].set_ylabel("Evaluation Cost")
+    axes2[2].legend()
 
     if output_dir:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -188,19 +202,11 @@ def plot_single_user_llm_results(results: dict, output_dir: str | None = None) -
 def plot_single_user_llm_batch_results(results: dict, output_dir: str | None = None) -> None:
     scenario_names = list(results["scenarios"].keys())
     methods = list(next(iter(results["scenarios"].values()))["method_summaries"].keys())
-    metrics = ["evaluation_cost", "avg_service_distance", "avg_migration_count", "jitter_ratio"]
-    titles = {
-        "evaluation_cost": "Evaluation Cost",
-        "avg_service_distance": "Avg Service Distance",
-        "avg_migration_count": "Avg Migration Count",
-        "jitter_ratio": "Jitter Ratio",
-    }
-
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9), constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
     axes = axes.reshape(-1)
     width = 0.14
     x = np.arange(len(scenario_names))
-    for ax, metric in zip(axes, metrics):
+    for ax, (metric, title) in zip(axes, _BATCH_SUMMARY_METRICS):
         for idx, method in enumerate(methods):
             values = [results["scenarios"][scenario]["method_summaries"][method][metric] for scenario in scenario_names]
             errors = [results["scenarios"][scenario]["method_summary_std"][method][metric] for scenario in scenario_names]
@@ -210,32 +216,84 @@ def plot_single_user_llm_batch_results(results: dict, output_dir: str | None = N
                 width=width,
                 yerr=errors,
                 capsize=3,
-                label=method if metric == metrics[0] else None,
+                label=method if metric == _BATCH_SUMMARY_METRICS[0][0] else None,
             )
-        ax.set_title(titles[metric])
+        ax.set_title(title)
         ax.set_xticks(x, scenario_names)
         ax.tick_params(axis="x", labelrotation=20)
         ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+    semantic_score_values = [results["scenarios"][scenario]["semantic_review"]["methods"]["llm_meta_mdp"]["semantic_consistency_score"] for scenario in scenario_names]
+    semantic_score_baseline = [results["scenarios"][scenario]["semantic_review"]["methods"]["mdp_baseline"]["semantic_consistency_score"] for scenario in scenario_names]
+    ax_semantic = axes[len(_BATCH_SUMMARY_METRICS)]
+    ax_semantic.bar(x - width / 2, semantic_score_baseline, width=width, color="#6366f1", label="mdp_baseline")
+    ax_semantic.bar(x + width / 2, semantic_score_values, width=width, color="#dc2626", label="llm_meta_mdp")
+    ax_semantic.set_title("Semantic Consistency Score")
+    ax_semantic.set_xticks(x, scenario_names)
+    ax_semantic.tick_params(axis="x", labelrotation=20)
+    ax_semantic.yaxis.set_major_locator(MaxNLocator(nbins=6))
     axes[0].legend()
 
     fig2, ax2 = plt.subplots(figsize=(12, 5), constrained_layout=True)
-    llm_values = [results["scenarios"][scenario]["method_summaries"]["llm_meta_mdp"]["evaluation_cost"] for scenario in scenario_names]
-    llm_errors = [results["scenarios"][scenario]["method_summary_std"]["llm_meta_mdp"]["evaluation_cost"] for scenario in scenario_names]
-    baseline_values = [results["scenarios"][scenario]["method_summaries"]["mdp_baseline"]["evaluation_cost"] for scenario in scenario_names]
-    baseline_errors = [results["scenarios"][scenario]["method_summary_std"]["mdp_baseline"]["evaluation_cost"] for scenario in scenario_names]
-    ax2.errorbar(scenario_names, baseline_values, yerr=baseline_errors, marker="o", capsize=4, label="MDP baseline", color="#6366f1")
-    ax2.errorbar(scenario_names, llm_values, yerr=llm_errors, marker="o", capsize=4, label="LLM-Meta-MDP", color="#dc2626")
-    ax2.set_ylabel("Evaluation Cost")
-    ax2.set_title("LLM vs MDP Across Scenarios")
+    llm_values = [results["scenarios"][scenario]["semantic_review"]["methods"]["llm_meta_mdp"]["semantic_consistency_score"] for scenario in scenario_names]
+    baseline_values = [results["scenarios"][scenario]["semantic_review"]["methods"]["mdp_baseline"]["semantic_consistency_score"] for scenario in scenario_names]
+    zero_errors = np.zeros(len(llm_values))
+    ax2.errorbar(scenario_names, baseline_values, yerr=zero_errors, marker="o", capsize=4, label="MDP baseline", color="#6366f1")
+    ax2.errorbar(scenario_names, llm_values, yerr=zero_errors, marker="o", capsize=4, label="LLM-Meta-MDP", color="#dc2626")
+    ax2.set_ylabel("Semantic Consistency Score")
+    ax2.set_title("Scenario Goal Alignment")
     ax2.legend()
     ax2.tick_params(axis="x", labelrotation=20)
+
+    fig3, ax3 = plt.subplots(figsize=(13, 6), constrained_layout=True)
+    primary_metric_rows: list[tuple[str, str, float]] = []
+    for scenario_name in scenario_names:
+        semantic_review = results["scenarios"][scenario_name]["semantic_review"]
+        llm_primary = semantic_review["semantic_primary_improvements_raw"]["llm_meta_mdp"]
+        for metric in semantic_review["primary_metrics"]:
+            primary_metric_rows.append((scenario_name, metric, llm_primary[metric] * 100.0))
+
+    if primary_metric_rows:
+        labels = [f"{scenario}\n{metric}" for scenario, metric, _ in primary_metric_rows]
+        values = [value for _, _, value in primary_metric_rows]
+        colors = ["#10b981" if value >= 0 else "#ef4444" for value in values]
+        x = np.arange(len(primary_metric_rows))
+        ax3.bar(x, values, color=colors)
+        ax3.axhline(0.0, color="#475569", linewidth=1)
+        ax3.set_xticks(x, labels)
+        ax3.tick_params(axis="x", labelrotation=35)
+        ax3.set_ylabel("Raw Improvement Percent")
+        ax3.set_title("LLM Primary Metric Improvements Over MDP Baseline")
+
+    fig4, axes4 = plt.subplots(3, 2, figsize=(14, 12), constrained_layout=True)
+    axes4 = axes4.reshape(-1)
+    for ax, scenario_name in zip(axes4, scenario_names):
+        semantic_review = results["scenarios"][scenario_name]["semantic_review"]
+        metrics = semantic_review["primary_metrics"]
+        llm_raw = [semantic_review["semantic_primary_improvements_raw"]["llm_meta_mdp"][metric] * 100.0 for metric in metrics]
+        baseline_raw = [semantic_review["semantic_primary_improvements_raw"]["mdp_baseline"][metric] * 100.0 for metric in metrics]
+        x = np.arange(len(metrics))
+        ax.bar(x - width / 2, baseline_raw, width=width, color="#6366f1", label="mdp_baseline")
+        ax.bar(x + width / 2, llm_raw, width=width, color="#dc2626", label="llm_meta_mdp")
+        ax.axhline(0.0, color="#475569", linewidth=1)
+        ax.set_title(scenario_name)
+        ax.set_xticks(x, metrics)
+        ax.tick_params(axis="x", labelrotation=25)
+        ax.set_ylabel("Raw Improvement Percent")
+    for ax in axes4[len(scenario_names) :]:
+        ax.axis("off")
+    if len(scenario_names) > 0:
+        axes4[0].legend()
 
     if output_dir:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         fig.savefig(Path(output_dir) / "single_user_llm_batch_summary.png", dpi=200, bbox_inches="tight")
         fig2.savefig(Path(output_dir) / "single_user_llm_batch_compare.png", dpi=200, bbox_inches="tight")
+        fig3.savefig(Path(output_dir) / "single_user_llm_primary_metric_improvements.png", dpi=200, bbox_inches="tight")
+        fig4.savefig(Path(output_dir) / "single_user_llm_scenario_primary_metrics.png", dpi=200, bbox_inches="tight")
         plt.close(fig)
         plt.close(fig2)
+        plt.close(fig3)
+        plt.close(fig4)
     else:
         plt.show()
 

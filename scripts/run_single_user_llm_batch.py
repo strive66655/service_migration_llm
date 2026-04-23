@@ -18,31 +18,37 @@ from mdp_migration.plotting import (
     plot_single_user_llm_results,
     plot_single_user_llm_tradeoff,
 )
+from mdp_migration.semantic_eval import (
+    SEMANTIC_NEGATIVE_THRESHOLD,
+    SEMANTIC_POSITIVE_THRESHOLD,
+    build_semantic_review,
+    relative_improvement,
+)
 from mdp_migration.single_user_llm import SingleUserLLMConfig, run_single_user_llm_loop
 
 PRIMARY_METRICS = ["evaluation_cost", "avg_service_distance", "avg_migration_count", "jitter_ratio"]
-AUX_METRICS = ["distance_violation_ratio", "avg_migration_distance"]
-EXPLANATORY_METRICS = ["run_cost"]
+AUX_METRICS = ["avg_migration_distance"]
+EXPLANATORY_METRICS: list[str] = []
 SCENARIO_REVIEW_GUIDES = {
     "balanced": {
-        "primary_metrics": ["avg_service_distance", "avg_migration_count"],
+        "primary_metrics": ["avg_service_distance", "avg_migration_count", "jitter_ratio"],
         "aux_metrics": ["evaluation_cost"],
-        "judgement_focus": "Check whether service distance and migration count reach a reasonable trade-off.",
+        "judgement_focus": "Check whether service distance, migration frequency, and jitter reach a reasonable overall compromise.",
     },
     "latency": {
-        "primary_metrics": ["avg_service_distance", "distance_violation_ratio"],
-        "aux_metrics": ["avg_migration_count"],
-        "judgement_focus": "Check whether service stays close to the user and distance violations remain low; extra migrations are acceptable but should stay controlled.",
+        "primary_metrics": ["avg_service_distance"],
+        "aux_metrics": ["avg_migration_count", "evaluation_cost"],
+        "judgement_focus": "Check whether service stays close to the user; extra migrations are acceptable but should stay controlled.",
     },
     "stability": {
-        "primary_metrics": ["jitter_ratio", "avg_migration_count"],
-        "aux_metrics": ["avg_service_distance"],
+        "primary_metrics": ["avg_migration_count", "jitter_ratio"],
+        "aux_metrics": ["avg_service_distance", "evaluation_cost"],
         "judgement_focus": "Check whether switching jitter and migration frequency are suppressed; service distance can worsen slightly but not too much.",
     },
     "delay_tolerant": {
-        "primary_metrics": ["avg_migration_count", "run_cost"],
-        "aux_metrics": ["avg_service_distance"],
-        "judgement_focus": "Check whether migration count and system cost are reduced without over-migrating just to keep the service closer.",
+        "primary_metrics": ["avg_migration_count"],
+        "aux_metrics": ["avg_service_distance", "evaluation_cost"],
+        "judgement_focus": "Check whether migration frequency is reduced without over-migrating just to keep the service closer.",
     },
     "conflict": {
         "primary_metrics": ["avg_service_distance", "avg_migration_count", "jitter_ratio"],
@@ -173,16 +179,27 @@ def _format_metric_cell(mean: float, std: float) -> str:
     return f"{mean:.4f} +- {std:.4f}"
 
 
+def _pct_change(baseline: float, method: float) -> float:
+    return relative_improvement(baseline, method) * 100.0
+
+
 def _write_markdown_tables(aggregated: dict, output_path: Path) -> None:
     scenarios = aggregated["scenarios"]
     methods = list(next(iter(scenarios.values()))["method_summaries"].keys())
 
-    metrics_md = ["# Single-User LLM Metrics", ""]
+    metrics_md = [
+        "# General Metrics and Atomic Metrics",
+        "",
+        "The normalized `evaluation_cost` is a shared general comparison metric. Atomic metrics remain necessary to interpret scenario-specific semantic alignment.",
+        "",
+    ]
     for metric_group_name, metric_names in [
         ("Primary Metrics", PRIMARY_METRICS),
         ("Auxiliary Metrics", AUX_METRICS),
         ("Explanatory Metrics", EXPLANATORY_METRICS),
     ]:
+        if not metric_names:
+            continue
         metrics_md.append(f"## {metric_group_name}")
         metrics_md.append("")
         for metric in metric_names:
@@ -201,40 +218,64 @@ def _write_markdown_tables(aggregated: dict, output_path: Path) -> None:
             metrics_md.append("")
 
     improvement_md = [
-        "# LLM Improvement Over MDP Baseline",
+        "# General and Semantic Improvements Over MDP Baseline",
         "",
-        "| Scenario | Evaluation Cost d% | Service Distance d% | Migration Count d% | Jitter Ratio d% |",
-        "| --- | --- | --- | --- | --- |",
+        "| Scenario | Evaluation Cost d% | Semantic Score | Alignment |",
+        "| --- | --- | --- | --- |",
     ]
     for scenario_name, scenario_result in scenarios.items():
         baseline = scenario_result["method_summaries"]["mdp_baseline"]
         llm = scenario_result["method_summaries"]["llm_meta_mdp"]
-
-        def pct(metric: str) -> float:
-            base = baseline[metric]
-            if abs(base) < 1e-12:
-                return 0.0
-            return (llm[metric] - base) / base * 100.0
+        semantic_methods = scenario_result["semantic_review"]["methods"]
 
         improvement_md.append(
-            f"| {scenario_name} | {pct('evaluation_cost'):.2f}% | {pct('avg_service_distance'):.2f}% | {pct('avg_migration_count'):.2f}% | {pct('jitter_ratio'):.2f}% |"
+            f"| {scenario_name} | {_pct_change(baseline['evaluation_cost'], llm['evaluation_cost']):.2f}% | {semantic_methods['llm_meta_mdp']['semantic_consistency_score']:.4f} | {semantic_methods['llm_meta_mdp']['semantic_alignment_label']} |"
         )
 
     scenario_md = [
         "# Scenario Definitions",
         "",
-        "| Scenario | Business Profile | Primary Metrics | Auxiliary Metrics | Judgement Focus | Operator Text | Failure Mode |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        f"| Scenario | Business Profile | Primary Metrics | Auxiliary Metrics | Judgement Focus | Operator Text | Failure Mode | Semantic Thresholds |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for scenario_name, definition in aggregated["scenario_definitions"].items():
         review_guide = definition.get("review_guide", {})
         scenario_md.append(
-            f"| {scenario_name} | {definition['business_profile']} | {', '.join(review_guide.get('primary_metrics', []))} | {', '.join(review_guide.get('aux_metrics', []))} | {review_guide.get('judgement_focus', '')} | {definition['operator_text']} | {definition['failure_mode'] or 'none'} |"
+            f"| {scenario_name} | {definition['business_profile']} | {', '.join(review_guide.get('primary_metrics', []))} | {', '.join(review_guide.get('aux_metrics', []))} | {review_guide.get('judgement_focus', '')} | {definition['operator_text']} | {definition['failure_mode'] or 'none'} | improved>{SEMANTIC_POSITIVE_THRESHOLD:.2f}, not_aligned<{SEMANTIC_NEGATIVE_THRESHOLD:.2f} |"
         )
+
+    semantic_alignment_md = [
+        "# Semantic Alignment Scores",
+        "",
+        "| Scenario | Method | Semantic Score | Alignment | Primary Metrics |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    raw_improvement_md = [
+        "# Primary Metric Improvements Over MDP Baseline",
+        "",
+        "| Scenario | Method | Metric | Raw Improvement d% | Clipped Improvement |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for scenario_name, scenario_result in scenarios.items():
+        semantic_review = scenario_result["semantic_review"]
+        primary_metric_names = ", ".join(semantic_review["primary_metrics"])
+        for method in methods:
+            semantic_method = semantic_review["methods"][method]
+            semantic_alignment_md.append(
+                f"| {scenario_name} | {method} | {semantic_method['semantic_consistency_score']:.4f} | {semantic_method['semantic_alignment_label']} | {primary_metric_names} |"
+            )
+            for metric in semantic_review["primary_metrics"]:
+                raw_value = semantic_review["semantic_primary_improvements_raw"][method][metric] * 100.0
+                clipped_value = semantic_review["semantic_primary_improvements_clipped"][method][metric]
+                raw_improvement_md.append(
+                    f"| {scenario_name} | {method} | {metric} | {raw_value:.2f}% | {clipped_value:.4f} |"
+                )
 
     (output_path / "single_user_llm_metrics_table.md").write_text("\n".join(metrics_md), encoding="utf-8")
     (output_path / "single_user_llm_improvement_table.md").write_text("\n".join(improvement_md), encoding="utf-8")
     (output_path / "single_user_llm_scenarios.md").write_text("\n".join(scenario_md), encoding="utf-8")
+    (output_path / "single_user_llm_semantic_alignment_table.md").write_text("\n".join(semantic_alignment_md), encoding="utf-8")
+    (output_path / "single_user_llm_primary_metric_improvement_table.md").write_text("\n".join(raw_improvement_md), encoding="utf-8")
 
 
 def _load_json(path: Path) -> dict:
@@ -255,6 +296,18 @@ def _merge_results(base: dict, updates: dict) -> dict:
     merged_scenarios.update(updates.get("scenarios", {}))
     merged["scenarios"] = merged_scenarios
     return merged
+
+
+def _attach_semantic_review(aggregated: dict) -> dict:
+    for scenario_name, scenario_result in aggregated["scenarios"].items():
+        review_guide = aggregated["scenario_definitions"][scenario_name].get("review_guide", {})
+        primary_metrics = review_guide.get("primary_metrics", [])
+        semantic_review = build_semantic_review(scenario_result["method_summaries"], primary_metrics)
+        scenario_result["semantic_primary_improvements_raw"] = semantic_review["semantic_primary_improvements_raw"]
+        scenario_result["semantic_primary_improvements_clipped"] = semantic_review["semantic_primary_improvements_clipped"]
+        scenario_result["semantic_scores"] = semantic_review["semantic_scores"]
+        scenario_result["semantic_review"] = semantic_review
+    return aggregated
 
 
 def main() -> None:
@@ -339,6 +392,7 @@ def main() -> None:
         representative_path = save_path / "single_user_llm_representative.json"
         if representative_result is None and representative_path.exists():
             representative_result = _load_json(representative_path)
+    aggregated = _attach_semantic_review(aggregated)
     save_json(save_path / "single_user_llm_batch_results.json", aggregated)
     _write_markdown_tables(aggregated, save_path)
     if representative_result is not None:

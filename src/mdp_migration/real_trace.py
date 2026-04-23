@@ -6,7 +6,7 @@ import numpy as np
 
 from .core import CostParams, RealTraceConfig, matlab_round_or_ceil, nearest_cloud_index, nearest_state_index, reduced_chain_from_stay_probability
 from .io import load_trace_data, scalar
-from .policies import ModifiedPolicyIterationPolicy, MyopicPolicy, PolicyContext
+from .policies import ModifiedPolicyIterationPolicy, MyopicPolicy, PolicyContext, PolicyIterationPolicy
 
 
 def _build_cost_params(total_users: np.ndarray, timeslot: int, config: RealTraceConfig) -> CostParams:
@@ -103,7 +103,11 @@ def run_real_trace(config: RealTraceConfig) -> dict:
         cost_params = _build_cost_params(total_users, timeslot, config)
         cost_params_by_timeslot[timeslot] = cost_params
         myopic_result = MyopicPolicy().solve(PolicyContext(np.eye(num_states_2d_total), cost_params, 1, coordinates, cell_dist, action_mode="standard"))
-        threshold_result = ModifiedPolicyIterationPolicy().solve(PolicyContext(reduced_p, cost_params, 1, action_mode="distance"))
+        threshold_context = PolicyContext(reduced_p, cost_params, 1, action_mode="distance")
+        try:
+            threshold_result = ModifiedPolicyIterationPolicy().solve(threshold_context)
+        except np.linalg.LinAlgError:
+            threshold_result = PolicyIterationPolicy().solve(threshold_context)
         actions_myopic_each_timeslot[timeslot] = myopic_result.actions
         actions_threshold_each_timeslot[timeslot] = threshold_result.actions
         values_threshold_each_timeslot[:, timeslot] = threshold_result.state_values

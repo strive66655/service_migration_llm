@@ -18,6 +18,13 @@ from mdp_migration.random_walk import RandomWalkConfig, run_random_walk
 import mdp_migration.real_trace as real_trace_module
 from mdp_migration.real_trace import RealTraceConfig, run_real_trace
 from mdp_migration.plotting import plot_single_user_llm_multi_agent_diagnostics
+from mdp_migration.semantic_eval import (
+    SEMANTIC_NEGATIVE_THRESHOLD,
+    SEMANTIC_POSITIVE_THRESHOLD,
+    build_semantic_review,
+    clipped_relative_improvement,
+    relative_improvement,
+)
 from mdp_migration.single_user_llm import SingleUserLLMConfig, run_single_user_llm_loop
 
 
@@ -211,6 +218,42 @@ class CoreTests(unittest.TestCase):
         self.assertGreater(len(result["llm_decisions"]), 0)
         self.assertIn("forecaster", result["llm_decisions"][0]["agent_metrics"])
         self.assertIn("single_agent", result["llm_decisions"][0]["agent_metrics"])
+        metric_definition = result["evaluation_metric_definition"]
+        self.assertEqual(metric_definition["weights"]["service_distance"], 0.25)
+        self.assertIn("environment_bounds", metric_definition)
+        self.assertIn("normalization", metric_definition)
+        self.assertIn("component_notes", metric_definition)
+        self.assertTrue(0.0 <= result["method_summaries"]["llm_meta_mdp"]["evaluation_cost"] <= 1.0)
+
+    def test_single_user_llm_uses_deterministic_1d_environment_bounds(self) -> None:
+        result = run_single_user_llm_loop(
+            SingleUserLLMConfig(
+                use_2d=False,
+                sim_seed=7,
+                num_steps=8,
+                llm_refresh_interval=2,
+                num_states_left=2,
+                num_states_right=4,
+            )
+        )
+        bounds = result["evaluation_metric_definition"]["environment_bounds"]
+        self.assertEqual(bounds["max_service_distance"], 4.0)
+        self.assertEqual(bounds["max_migration_distance"], 6.0)
+
+    def test_single_user_llm_uses_deterministic_2d_environment_bounds(self) -> None:
+        result = run_single_user_llm_loop(
+            SingleUserLLMConfig(
+                use_2d=True,
+                sim_seed=5,
+                num_steps=8,
+                llm_refresh_interval=2,
+                num_states_2d=3,
+            )
+        )
+        bounds = result["evaluation_metric_definition"]["environment_bounds"]
+        self.assertGreater(bounds["max_service_distance"], 0.0)
+        self.assertGreaterEqual(bounds["max_migration_distance"], bounds["max_service_distance"])
+        self.assertLessEqual(result["method_summaries"]["llm_meta_mdp"]["evaluation_cost"], 1.0)
 
     def test_single_user_llm_timeout_falls_back(self) -> None:
         result = run_single_user_llm_loop(
@@ -262,6 +305,72 @@ class CoreTests(unittest.TestCase):
         output_dir.mkdir(parents=True, exist_ok=True)
         plot_single_user_llm_multi_agent_diagnostics(result, str(output_dir))
         self.assertTrue((output_dir / "single_user_llm_multi_agent_diagnostics.png").exists())
+
+    def test_semantic_review_uses_clipped_improvements_for_score(self) -> None:
+        method_summaries = {
+            "mdp_baseline": {
+                "avg_service_distance": 0.01,
+                "avg_migration_count": 0.02,
+            },
+            "llm_meta_mdp": {
+                "avg_service_distance": 0.04,
+                "avg_migration_count": 0.01,
+            },
+        }
+        review = build_semantic_review(method_summaries, ["avg_service_distance", "avg_migration_count"])
+        raw_distance = relative_improvement(0.01, 0.04)
+        clipped_distance = clipped_relative_improvement(raw_distance)
+        self.assertLess(raw_distance, -1.0)
+        self.assertEqual(clipped_distance, -1.0)
+        self.assertEqual(
+            review["semantic_primary_improvements_raw"]["llm_meta_mdp"]["avg_service_distance"],
+            raw_distance,
+        )
+        self.assertEqual(
+            review["semantic_primary_improvements_clipped"]["llm_meta_mdp"]["avg_service_distance"],
+            clipped_distance,
+        )
+        expected_score = (
+            clipped_distance
+            + clipped_relative_improvement(relative_improvement(0.02, 0.01))
+        ) / 2.0
+        self.assertAlmostEqual(
+            review["methods"]["llm_meta_mdp"]["semantic_consistency_score"],
+            expected_score,
+        )
+
+    def test_semantic_review_labels_follow_threshold_constants(self) -> None:
+        improved_review = build_semantic_review(
+            {
+                "mdp_baseline": {"avg_migration_count": 1.0, "jitter_ratio": 1.0},
+                "llm_meta_mdp": {"avg_migration_count": 0.8, "jitter_ratio": 0.8},
+            },
+            ["avg_migration_count", "jitter_ratio"],
+        )
+        self.assertGreater(
+            improved_review["methods"]["llm_meta_mdp"]["semantic_consistency_score"],
+            SEMANTIC_POSITIVE_THRESHOLD,
+        )
+        self.assertEqual(
+            improved_review["methods"]["llm_meta_mdp"]["semantic_alignment_label"],
+            "improved",
+        )
+
+        negative_review = build_semantic_review(
+            {
+                "mdp_baseline": {"avg_migration_count": 1.0, "jitter_ratio": 1.0},
+                "llm_meta_mdp": {"avg_migration_count": 1.2, "jitter_ratio": 1.2},
+            },
+            ["avg_migration_count", "jitter_ratio"],
+        )
+        self.assertLess(
+            negative_review["methods"]["llm_meta_mdp"]["semantic_consistency_score"],
+            SEMANTIC_NEGATIVE_THRESHOLD,
+        )
+        self.assertEqual(
+            negative_review["methods"]["llm_meta_mdp"]["semantic_alignment_label"],
+            "not_aligned",
+        )
 
 
 if __name__ == "__main__":

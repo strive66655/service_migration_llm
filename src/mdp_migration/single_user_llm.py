@@ -12,6 +12,8 @@ from .llm import DEFAULT_SAFE_CONTROL, SafeControlParams, apply_control_params, 
 from .llm.schema import FIXED_SOLVER_MODE
 from .policies import AlwaysMigratePolicy, ModifiedPolicyIterationPolicy, MyopicPolicy, NeverMigratePolicy, PolicyContext, PolicyIterationPolicy
 
+_EPSILON = 1e-12
+
 
 @dataclass(slots=True)
 class SingleUserLLMConfig:
@@ -136,6 +138,42 @@ def _immediate_cost(env: _EnvironmentSpec, cost_params: CostParams, state_index:
     return float(migrate_cost + trans_cost)
 
 
+def _environment_bounds(env: _EnvironmentSpec) -> dict[str, float]:
+    if env.hop_distances is not None:
+        zero_based_anchor = env.zero_state_index - 1
+        max_service_distance = float(np.max(env.hop_distances[zero_based_anchor, :]))
+        max_migration_distance = float(np.max(env.hop_distances))
+    else:
+        num_states = env.transition_matrix.shape[0]
+        zero_state = env.zero_state_index
+        max_service_distance = float(max(abs(state - zero_state) for state in range(1, num_states + 1)))
+        max_migration_distance = float(num_states - 1)
+    return {
+        "max_service_distance": max(max_service_distance, _EPSILON),
+        "max_migration_distance": max(max_migration_distance, _EPSILON),
+    }
+
+
+def _normalized_evaluation_cost(
+    service_distance: int,
+    migration_distance: int,
+    migration_flag: int,
+    instability_flag: int,
+    *,
+    bounds: dict[str, float],
+) -> float:
+    norm_service_distance = float(service_distance) / bounds["max_service_distance"]
+    norm_migration_distance = float(migration_distance) / bounds["max_migration_distance"]
+    norm_migration_flag = float(migration_flag)
+    norm_instability_flag = float(instability_flag)
+    return 0.25 * (
+        norm_service_distance
+        + norm_migration_distance
+        + norm_migration_flag
+        + norm_instability_flag
+    )
+
+
 def _sample_next_state(row: np.ndarray, draw: float) -> int:
     cdf = np.cumsum(row)
     idx = int(np.searchsorted(cdf, draw, side="right"))
@@ -183,12 +221,10 @@ def _solve_policy_actions(env: _EnvironmentSpec, cost_params: CostParams, solver
 def _collect_summary(trace: dict[str, list[float] | list[int]]) -> dict[str, Any]:
     return {
         "avg_service_distance": float(np.mean(np.asarray(trace["service_distance"], dtype=float))),
-        "distance_violation_ratio": float(np.mean(np.asarray(trace["distance_violation"], dtype=float))),
         "avg_migration_distance": float(np.mean(np.asarray(trace["migration_distance"], dtype=float))),
         "avg_migration_count": float(np.mean(np.asarray(trace["migration_flag"], dtype=float))),
         "jitter_ratio": float(np.mean(np.asarray(trace["instability_flag"], dtype=float))),
         "evaluation_cost": float(np.mean(np.asarray(trace["evaluation_cost"], dtype=float))),
-        "run_cost": float(np.mean(np.asarray(trace["run_cost"], dtype=float))),
     }
 
 
@@ -291,6 +327,7 @@ def _print_progress(
 
 def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
     env, base_cost_params = _build_environment(config)
+    env_bounds = _environment_bounds(env)
     standard_context = _standard_context(env, base_cost_params)
     baseline_actions = {
         "never_migrate": NeverMigratePolicy().solve(standard_context).actions,
@@ -307,9 +344,7 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
                 "migration_distance": [],
                 "migration_flag": [],
                 "instability_flag": [],
-                "distance_violation": [],
                 "evaluation_cost": [],
-                "run_cost": [],
                 "actions": [],
                 "states": [],
             },
@@ -327,7 +362,6 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
     }
     llm_decisions: list[dict[str, Any]] = []
     draws = np.random.default_rng(config.sim_seed + 97).random(config.num_steps)
-    weights = config.evaluation_weights
     total_refreshes = len(_refresh_schedule(config))
     requests_per_refresh = _requests_per_refresh(config)
     total_requests = total_refreshes * requests_per_refresh
@@ -405,23 +439,20 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
             migration_distance = _distance(env, current_state, action)
             migration_flag = int(action != current_state)
             instability_flag = int(migration_flag and method["prev_migration_flag"])
-            evaluation_cost = (
-                weights[0] * service_distance
-                + weights[1] * migration_distance
-                + weights[2] * migration_flag
-                + weights[3] * instability_flag
+            evaluation_cost = _normalized_evaluation_cost(
+                service_distance,
+                migration_distance,
+                migration_flag,
+                instability_flag,
+                bounds=env_bounds,
             )
-            run_cost_params = llm_cost_params if name == "llm_meta_mdp" else base_cost_params
-            run_cost = _immediate_cost(env, run_cost_params, current_state, action)
 
             trace = method["trace"]
             trace["service_distance"].append(service_distance)
             trace["migration_distance"].append(migration_distance)
             trace["migration_flag"].append(migration_flag)
             trace["instability_flag"].append(instability_flag)
-            trace["distance_violation"].append(int(service_distance > config.distance_threshold))
             trace["evaluation_cost"].append(float(evaluation_cost))
-            trace["run_cost"].append(run_cost)
             trace["actions"].append(action)
             trace["states"].append(current_state)
 
@@ -452,13 +483,46 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
         "method_summaries": {name: _collect_summary(methods[name]["trace"]) for name in methods},
         "method_traces": {name: methods[name]["trace"] for name in methods},
         "evaluation_metric_definition": {
+            "interpretation": "general comparison metric, not the sole criterion",
             "weights": {
-                "service_distance": weights[0],
-                "migration_distance": weights[1],
-                "migration_count": weights[2],
-                "instability": weights[3],
+                "service_distance": 0.25,
+                "migration_distance": 0.25,
+                "migration_count": 0.25,
+                "instability": 0.25,
+            },
+            "environment_bounds": {
+                "max_service_distance": env_bounds["max_service_distance"],
+                "max_migration_distance": env_bounds["max_migration_distance"],
+            },
+            "normalization": {
+                "service_distance": {
+                    "type": "deterministic_max",
+                    "min": 0.0,
+                    "max": env_bounds["max_service_distance"],
+                },
+                "migration_distance": {
+                    "type": "deterministic_max",
+                    "min": 0.0,
+                    "max": env_bounds["max_migration_distance"],
+                },
+                "migration_count": {
+                    "type": "identity_binary",
+                    "min": 0.0,
+                    "max": 1.0,
+                },
+                "instability": {
+                    "type": "identity_binary",
+                    "min": 0.0,
+                    "max": 1.0,
+                },
+            },
+            "component_notes": {
+                "service_distance": "Measures service proximity to the user anchor.",
+                "migration_distance": "Measures the magnitude of a migration when it occurs.",
+                "migration_count": "Measures whether a migration occurs at the current step.",
+                "instability": "Measures jitter risk caused by consecutive migrations.",
             },
             "distance_threshold": config.distance_threshold,
-            "notes": "evaluation_cost is fixed across all methods and is separate from run_cost.",
+            "notes": "evaluation_cost is normalized by deterministic environment bounds, shared across all methods, and should be interpreted together with atomic metrics because semantic goals may emphasize only a subset of components.",
         },
     }
