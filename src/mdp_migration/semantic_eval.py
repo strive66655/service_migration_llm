@@ -10,7 +10,15 @@ _EPSILON = 1e-12
 
 
 def relative_improvement(baseline: float, method: float, *, epsilon: float = _EPSILON) -> float:
-    return (float(baseline) - float(method)) / max(abs(float(baseline)), epsilon)
+    baseline_value = float(baseline)
+    method_value = float(method)
+    if abs(baseline_value) < epsilon:
+        if abs(method_value) < epsilon:
+            return 0.0
+        # Metrics are cost-like, so lower is better. When the baseline is zero,
+        # use a finite sentinel instead of an epsilon denominator explosion.
+        return 1.0 if method_value < baseline_value else -1.0
+    return (baseline_value - method_value) / abs(baseline_value)
 
 
 def clipped_relative_improvement(raw_improvement: float) -> float:

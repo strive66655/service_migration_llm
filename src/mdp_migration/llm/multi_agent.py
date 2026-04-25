@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Any
 
 from .client import query_llm
+from .prompting import build_decision_summary
 from .schema import DEFAULT_SAFE_CONTROL, FIXED_SOLVER_MODE, SafeControlParams
 from .validator import validate_llm_output
 
@@ -51,6 +52,7 @@ def build_shared_control_state(state: dict[str, Any], history: dict[str, Any], b
     previous_distance = recent_service_distances[-1] if recent_service_distances else int(state["distance_to_user"])
     distance_delta = int(state["distance_to_user"]) - previous_distance
     recent_direction = int(state.get("recent_direction", 0))
+    decision_summary = build_decision_summary(state, recent_service_distances, recent_migrations)
     return asdict(
         SharedControlState(
             current_state={
@@ -65,6 +67,7 @@ def build_shared_control_state(state: dict[str, Any], history: dict[str, Any], b
             recent_history={
                 "migration_count_recent": int(sum(recent_migrations)),
                 "average_service_distance_recent": float(sum(recent_service_distances) / len(recent_service_distances)) if recent_service_distances else float(state["distance_to_user"]),
+                **decision_summary,
             },
             business_profile=business_profile,
             operator_text=operator_text or "",
@@ -85,6 +88,7 @@ def build_forecaster_prompt(shared_control_state: dict[str, Any]) -> str:
         "You summarize short-horizon mobility for service migration.\n"
         "Return only a JSON object that matches the required schema.\n"
         "Keep the labels coarse and conservative.\n"
+        "Do not overreact to a single-step fluctuation when recent history is otherwise stable.\n"
         f"Required schema:\n{json.dumps(required_schema, ensure_ascii=False)}\n"
         f"STATE JSON:\n{json.dumps(shared_control_state, ensure_ascii=False)}"
     )
@@ -93,14 +97,18 @@ def build_forecaster_prompt(shared_control_state: dict[str, Any]) -> str:
 def build_policy_advisor_prompt(shared_control_state: dict[str, Any], forecast: dict[str, Any]) -> str:
     required_schema = {
         "objective_mode": "latency_first | stability_first | balanced",
-        "gamma": "float in [0.7, 0.99]",
+        "gamma": "float in [0.5, 0.99]",
         "migration_weight": "float in [0.5, 1.8]",
         "transmission_weight": "float in [0.5, 1.8]",
         "reason": "short explanation",
     }
     return (
-        "You recommend service migration control parameters.\n"
-        "Use the mobility summary conservatively and return only a JSON object matching the required schema.\n"
+        "You recommend service migration control parameters for a lower-level MDP; do not choose migration actions directly.\n"
+        "Use the mobility summary conservatively and explain in reason how the recommendation responds to the forecast.\n"
+        "If distance_trend is moving_away, consider whether transmission_weight should increase. If stability_risk is high, consider whether migration_weight should increase. If you do not follow the forecast, justify why in reason.\n"
+        "Business profile guidance: latency_sensitive prioritizes shorter service distance; delay_tolerant tolerates moderate service distance to reduce unnecessary migrations; migration_sensitive prioritizes reducing migration frequency and migration distance, even if moderate service distance must be tolerated; high_stability_required strongly avoids jitter and repeated migrations; balanced seeks a compromise.\n"
+        "migration_weight is a multiplicative scale applied to baseline migration-cost terms, not the paper's structural parameter -beta_l.\n"
+        "Return only a JSON object matching the required schema.\n"
         f"Required schema:\n{json.dumps(required_schema, ensure_ascii=False)}\n"
         f"STATE JSON:\n{json.dumps({'shared_control_state': shared_control_state, 'forecast': forecast}, ensure_ascii=False)}"
     )
@@ -233,6 +241,58 @@ def _decision_source(forecast: ForecastOutput, policy_raw: dict[str, Any] | None
     return "multi_agent_merged"
 
 
+def _has_conflict_goal(operator_text: str) -> bool:
+    normalized = operator_text.lower()
+    return any(
+        token in normalized
+        for token in (
+            "conflicting goal",
+            "balanced compromise",
+            "rather than optimizing only one metric",
+            "avoid too many migrations",
+            "suppress switching jitter",
+        )
+    )
+
+
+def _apply_safety_arbiter(
+    draft_control: dict[str, Any],
+    *,
+    forecast: ForecastOutput,
+    policy_raw: dict[str, Any] | None,
+    business_profile: str,
+    operator_text: str,
+) -> dict[str, Any]:
+    if policy_raw is None:
+        return {
+            "objective_mode": DEFAULT_SAFE_CONTROL.objective_mode,
+            "gamma": DEFAULT_SAFE_CONTROL.gamma,
+            "migration_weight": DEFAULT_SAFE_CONTROL.migration_weight,
+            "transmission_weight": DEFAULT_SAFE_CONTROL.transmission_weight,
+            "reason": "fallback to baseline MDP parameters after policy advisor timeout",
+        }
+
+    if forecast.used_fallback:
+        safe_draft = dict(draft_control)
+        safe_draft["objective_mode"] = DEFAULT_SAFE_CONTROL.objective_mode
+        safe_draft["gamma"] = min(float(safe_draft["gamma"]), DEFAULT_SAFE_CONTROL.gamma)
+        safe_draft["migration_weight"] = max(float(safe_draft["migration_weight"]), DEFAULT_SAFE_CONTROL.migration_weight)
+        safe_draft["transmission_weight"] = min(float(safe_draft["transmission_weight"]), DEFAULT_SAFE_CONTROL.transmission_weight)
+        safe_draft["reason"] = f"{safe_draft.get('reason', '')}; conservative fallback after forecast timeout".strip("; ")
+        return safe_draft
+
+    if business_profile == "balanced" and _has_conflict_goal(operator_text):
+        return {
+            "objective_mode": DEFAULT_SAFE_CONTROL.objective_mode,
+            "gamma": DEFAULT_SAFE_CONTROL.gamma,
+            "migration_weight": DEFAULT_SAFE_CONTROL.migration_weight,
+            "transmission_weight": DEFAULT_SAFE_CONTROL.transmission_weight,
+            "reason": "conflicting semantic goals detected; keep baseline MDP parameters to avoid one-sided optimization",
+        }
+
+    return draft_control
+
+
 def query_multi_agent_control(
     shared_control_state: dict[str, Any],
     *,
@@ -299,6 +359,13 @@ def query_multi_agent_control(
             "recent_history": shared_control_state["recent_history"]["migration_count_recent"],
         },
         forecast,
+        business_profile=shared_control_state["business_profile"],
+        operator_text=shared_control_state["operator_text"],
+    )
+    draft_control = _apply_safety_arbiter(
+        draft_control,
+        forecast=forecast,
+        policy_raw=policy_raw,
         business_profile=shared_control_state["business_profile"],
         operator_text=shared_control_state["operator_text"],
     )

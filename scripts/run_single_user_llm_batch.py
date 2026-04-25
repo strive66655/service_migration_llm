@@ -55,6 +55,11 @@ SCENARIO_REVIEW_GUIDES = {
         "aux_metrics": ["evaluation_cost"],
         "judgement_focus": "Check whether distance, migration count, and jitter achieve a balanced compromise rather than optimizing only one metric.",
     },
+    "timeout_fallback": {
+        "primary_metrics": ["avg_service_distance", "avg_migration_count", "jitter_ratio"],
+        "aux_metrics": ["evaluation_cost"],
+        "judgement_focus": "Check whether fallback behavior remains safe and close to the MDP baseline when LLM calls time out.",
+    },
 }
 
 

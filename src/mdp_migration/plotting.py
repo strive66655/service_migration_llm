@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.ticker import MaxNLocator
 
+from .semantic_eval import build_semantic_review
+
 
 _SINGLE_SUMMARY_METRICS = [
     ("evaluation_cost", "Evaluation Cost", "#3b82f6"),
@@ -22,6 +24,8 @@ _BATCH_SUMMARY_METRICS = [
     ("avg_migration_count", "Migration Count"),
     ("jitter_ratio", "Jitter Ratio"),
 ]
+
+_DEFAULT_SINGLE_SEMANTIC_PRIMARY_METRICS = ["avg_service_distance", "avg_migration_count", "jitter_ratio"]
 
 
 def _finite_series_values(series: list[np.ndarray]) -> np.ndarray:
@@ -189,12 +193,32 @@ def plot_single_user_llm_results(results: dict, output_dir: str | None = None) -
     axes2[2].set_ylabel("Evaluation Cost")
     axes2[2].legend()
 
+    semantic_review = results.get("semantic_review")
+    if semantic_review is None:
+        semantic_review = build_semantic_review(method_summaries, _DEFAULT_SINGLE_SEMANTIC_PRIMARY_METRICS)
+    semantic_scores = [semantic_review["methods"][method]["semantic_consistency_score"] for method in methods]
+    semantic_labels = [semantic_review["methods"][method]["semantic_alignment_label"] for method in methods]
+    colors = ["#10b981" if value > 0.05 else "#ef4444" if value < -0.05 else "#64748b" for value in semantic_scores]
+    fig3, ax3 = plt.subplots(figsize=(12, 5), constrained_layout=True)
+    ax3.bar(x, semantic_scores, color=colors)
+    ax3.axhline(0.0, color="#475569", linewidth=1)
+    ax3.axhline(0.05, color="#10b981", linewidth=1, linestyle="--", alpha=0.7)
+    ax3.axhline(-0.05, color="#ef4444", linewidth=1, linestyle="--", alpha=0.7)
+    ax3.set_title("Semantic Consistency Score")
+    ax3.set_ylabel("Score vs MDP Baseline")
+    ax3.set_xticks(x, labels)
+    ax3.tick_params(axis="x", labelrotation=20)
+    for idx, (score, label) in enumerate(zip(semantic_scores, semantic_labels)):
+        ax3.text(idx, score, f"{score:.2f}\n{label}", ha="center", va="bottom" if score >= 0 else "top", fontsize=8)
+
     if output_dir:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         fig1.savefig(Path(output_dir) / "single_user_llm_summary.png", dpi=200, bbox_inches="tight")
         fig2.savefig(Path(output_dir) / "single_user_llm_trace.png", dpi=200, bbox_inches="tight")
+        fig3.savefig(Path(output_dir) / "single_user_llm_semantic_alignment.png", dpi=200, bbox_inches="tight")
         plt.close(fig1)
         plt.close(fig2)
+        plt.close(fig3)
     else:
         plt.show()
 

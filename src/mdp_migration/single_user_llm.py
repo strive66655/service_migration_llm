@@ -11,6 +11,7 @@ from .core import CostParams, PolicyResult, build_1d_transition_matrix, build_ra
 from .llm import DEFAULT_SAFE_CONTROL, SafeControlParams, apply_control_params, build_llm_state, build_prompt, build_shared_control_state, query_llm, query_multi_agent_control, validate_llm_output
 from .llm.schema import FIXED_SOLVER_MODE
 from .policies import AlwaysMigratePolicy, ModifiedPolicyIterationPolicy, MyopicPolicy, NeverMigratePolicy, PolicyContext, PolicyIterationPolicy
+from .semantic_eval import build_semantic_review
 
 _EPSILON = 1e-12
 
@@ -41,7 +42,6 @@ class SingleUserLLMConfig:
     num_states_2d: int = 6
     cell_dist: float = 0.005
     center_coordinate: tuple[float, float] = (37.762, -122.43)
-    evaluation_weights: tuple[float, float, float, float] = (1.0, 0.75, 0.5, 1.25)
     distance_threshold: int = 3
 
 
@@ -228,6 +228,18 @@ def _collect_summary(trace: dict[str, list[float] | list[int]]) -> dict[str, Any
     }
 
 
+def _semantic_primary_metrics_for_profile(business_profile: str) -> list[str]:
+    if business_profile == "latency_sensitive":
+        return ["avg_service_distance"]
+    if business_profile == "delay_tolerant":
+        return ["avg_migration_count"]
+    if business_profile == "migration_sensitive":
+        return ["avg_migration_count", "avg_migration_distance"]
+    if business_profile == "high_stability_required":
+        return ["avg_migration_count", "jitter_ratio"]
+    return ["avg_service_distance", "avg_migration_count", "jitter_ratio"]
+
+
 def _build_shared_state_for_step(env: _EnvironmentSpec, current_state: int, history: dict[str, Any], config: SingleUserLLMConfig) -> dict[str, Any]:
     return build_shared_control_state(
         {
@@ -235,6 +247,7 @@ def _build_shared_state_for_step(env: _EnvironmentSpec, current_state: int, hist
             "service_index": current_state,
             "distance_to_user": _distance(env, current_state, env.zero_state_index),
             "recent_direction": 0 if len(history["recent_service_distances"]) < 2 else int(history["recent_service_distances"][-1] - history["recent_service_distances"][-2]),
+            "distance_threshold": config.distance_threshold,
         },
         history,
         config.business_profile,
@@ -372,10 +385,11 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
         if step % max(config.llm_refresh_interval, 1) == 0:
             current_state = int(methods["llm_meta_mdp"]["state"])
             shared_control_state = _build_shared_state_for_step(env, current_state, llm_history, config)
+            injected_failure_mode = config.failure_mode if config.failure_mode == "timeout" or step == 0 else None
             if config.controller_mode == "multi_agent":
                 diagnostics = query_multi_agent_control(
                     shared_control_state,
-                    failure_mode=config.failure_mode if step == 0 else None,
+                    failure_mode=injected_failure_mode,
                     backend=config.llm_backend,
                     model=config.llm_model,
                     api_base=config.llm_api_base,
@@ -393,6 +407,7 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
                         "service_index": current_state,
                         "distance_to_user": shared_control_state["current_state"]["distance_to_user"],
                         "recent_direction": shared_control_state["current_state"]["recent_direction"],
+                        "distance_threshold": config.distance_threshold,
                     },
                     {
                         "recent_service_distances": shared_control_state["recent_service_distances"],
@@ -407,7 +422,7 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
                     llm_raw = query_llm(
                         prompt,
                         state=llm_state,
-                        failure_mode=config.failure_mode if step == 0 else None,
+                        failure_mode=injected_failure_mode,
                         backend=config.llm_backend,
                         model=config.llm_model,
                         api_base=config.llm_api_base,
@@ -477,11 +492,22 @@ def run_single_user_llm_loop(config: SingleUserLLMConfig) -> dict[str, Any]:
     if config.show_progress:
         print(file=sys.stderr)
 
+    method_summaries = {name: _collect_summary(methods[name]["trace"]) for name in methods}
+    semantic_primary_metrics = _semantic_primary_metrics_for_profile(config.business_profile)
+    semantic_review = build_semantic_review(method_summaries, semantic_primary_metrics)
+
     return {
         "config": asdict(config),
         "llm_decisions": llm_decisions,
-        "method_summaries": {name: _collect_summary(methods[name]["trace"]) for name in methods},
+        "method_summaries": method_summaries,
         "method_traces": {name: methods[name]["trace"] for name in methods},
+        "semantic_metric_definition": {
+            "business_profile": config.business_profile,
+            "primary_metrics": semantic_primary_metrics,
+            "baseline_method": "mdp_baseline",
+            "notes": "Semantic consistency is computed against mdp_baseline using business-profile-specific primary metrics.",
+        },
+        "semantic_review": semantic_review,
         "evaluation_metric_definition": {
             "interpretation": "general comparison metric, not the sole criterion",
             "weights": {

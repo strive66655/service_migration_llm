@@ -33,7 +33,7 @@ def validate_llm_output(output: dict[str, Any] | None, fallback: SafeControlPara
     if "solver_mode" in output and str(output.get("solver_mode")) != FIXED_SOLVER_MODE:
         notes.append("solver_mode_locked")
 
-    gamma, gamma_note = _clip(output.get("gamma", safe_fallback.gamma), 0.7, 0.99, safe_fallback.gamma)
+    gamma, gamma_note = _clip(output.get("gamma", safe_fallback.gamma), 0.5, 0.99, safe_fallback.gamma)
     if gamma_note is not None:
         notes.append(f"gamma_{gamma_note}")
 

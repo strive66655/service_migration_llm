@@ -24,21 +24,21 @@ _OPENROUTER_SCHEMAS = {
                 },
                 "gamma": {
                     "type": "number",
-                    "minimum": 0.7,
+                    "minimum": 0.5,
                     "maximum": 0.99,
-                    "description": "Discount factor for the lower-level MDP.",
+                    "description": "Discount factor for the lower-level MDP. Larger values emphasize longer-term consequences.",
                 },
                 "migration_weight": {
                     "type": "number",
                     "minimum": 0.5,
                     "maximum": 1.8,
-                    "description": "Weight applied to migration cost terms.",
+                    "description": "Multiplicative scale applied to the baseline migration-cost terms. Values above 1 make migration more expensive; values below 1 make migration cheaper. This is not the paper's structural parameter -beta_l.",
                 },
                 "transmission_weight": {
                     "type": "number",
                     "minimum": 0.5,
                     "maximum": 1.8,
-                    "description": "Weight applied to transmission distance cost terms.",
+                    "description": "Multiplicative scale applied to the baseline transmission-cost terms. Values above 1 penalize service-user distance more strongly.",
                 },
                 "reason": {
                     "type": "string",
@@ -88,18 +88,21 @@ _OPENROUTER_SCHEMAS = {
                 },
                 "gamma": {
                     "type": "number",
-                    "minimum": 0.7,
+                    "minimum": 0.5,
                     "maximum": 0.99,
+                    "description": "Discount factor for the lower-level MDP. Larger values emphasize longer-term consequences.",
                 },
                 "migration_weight": {
                     "type": "number",
                     "minimum": 0.5,
                     "maximum": 1.8,
+                    "description": "Multiplicative scale applied to the baseline migration-cost terms. Values above 1 make migration more expensive; values below 1 make migration cheaper. This is not the paper's structural parameter -beta_l.",
                 },
                 "transmission_weight": {
                     "type": "number",
                     "minimum": 0.5,
                     "maximum": 1.8,
+                    "description": "Multiplicative scale applied to the baseline transmission-cost terms. Values above 1 penalize service-user distance more strongly.",
                 },
                 "reason": {
                     "type": "string",
@@ -113,9 +116,9 @@ _OPENROUTER_SCHEMAS = {
 }
 
 _SYSTEM_PROMPTS = {
-    "control": "You control a single-user service migration system. Return only valid JSON that matches the provided schema.",
-    "forecast": "You summarize short-horizon mobility state for service migration. Return only valid JSON that matches the provided schema.",
-    "policy_advice": "You recommend safe migration control parameters from a summarized state. Return only valid JSON that matches the provided schema.",
+    "control": "You are an MDP meta-controller for single-user service migration. Return only valid JSON that matches the provided schema.",
+    "forecast": "You summarize short-horizon mobility state for service migration. Keep labels coarse and conservative, and return only valid JSON that matches the provided schema.",
+    "policy_advice": "You recommend safe lower-level MDP control parameters from a summarized state and forecast. Return only valid JSON that matches the provided schema.",
 }
 
 

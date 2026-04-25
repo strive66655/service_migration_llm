@@ -12,12 +12,12 @@ if str(SRC) not in sys.path:
 import numpy as np
 
 from mdp_migration.core import CostParams, build_1d_transition_matrix, evaluate_policy, hex_grid_coordinates, hex_neighbor_matrix, map_threshold_actions_to_2d
-from mdp_migration.llm import DEFAULT_SAFE_CONTROL, apply_control_params, build_llm_state, build_prompt, build_shared_control_state, query_llm, query_multi_agent_control, validate_llm_output
+from mdp_migration.llm import DEFAULT_SAFE_CONTROL, apply_control_params, build_forecaster_prompt, build_llm_state, build_policy_advisor_prompt, build_prompt, build_shared_control_state, query_llm, query_multi_agent_control, validate_llm_output
 from mdp_migration.policies import ModifiedPolicyIterationPolicy, PolicyContext, PolicyIterationPolicy
 from mdp_migration.random_walk import RandomWalkConfig, run_random_walk
 import mdp_migration.real_trace as real_trace_module
 from mdp_migration.real_trace import RealTraceConfig, run_real_trace
-from mdp_migration.plotting import plot_single_user_llm_multi_agent_diagnostics
+from mdp_migration.plotting import plot_single_user_llm_multi_agent_diagnostics, plot_single_user_llm_results
 from mdp_migration.semantic_eval import (
     SEMANTIC_NEGATIVE_THRESHOLD,
     SEMANTIC_POSITIVE_THRESHOLD,
@@ -119,6 +119,31 @@ class CoreTests(unittest.TestCase):
         self.assertAlmostEqual(validated.migration_weight, 0.5)
         self.assertTrue(validated.used_fallback)
 
+    def test_llm_validation_accepts_paper_gamma_lower_bound(self) -> None:
+        validated = validate_llm_output(
+            {
+                "objective_mode": "balanced",
+                "gamma": 0.5,
+                "migration_weight": 1.0,
+                "transmission_weight": 1.0,
+                "reason": "paper lower-bound gamma",
+            }
+        )
+        self.assertAlmostEqual(validated.gamma, 0.5)
+        self.assertFalse(validated.used_fallback)
+
+        clipped = validate_llm_output(
+            {
+                "objective_mode": "balanced",
+                "gamma": 0.3,
+                "migration_weight": 1.0,
+                "transmission_weight": 1.0,
+                "reason": "below safe gamma",
+            }
+        )
+        self.assertAlmostEqual(clipped.gamma, 0.5)
+        self.assertIn("gamma_clipped", clipped.validation_notes)
+
     def test_llm_prompt_and_query(self) -> None:
         llm_state = build_llm_state(
             {"state_index": 3, "service_index": 3, "distance_to_user": 2, "recent_direction": 1},
@@ -127,9 +152,40 @@ class CoreTests(unittest.TestCase):
             "当前业务对时延敏感，可接受必要迁移",
         )
         prompt = build_prompt(llm_state)
+        self.assertIn("meta-controller", prompt)
+        self.assertIn("not the paper's structural parameter -beta_l", prompt)
+        self.assertIn("baseline migration-cost", prompt)
+        self.assertIn("migration_sensitive prioritizes reducing migration frequency and migration distance", prompt)
+        self.assertEqual(llm_state["history"]["distance_violation_count_recent"], 0)
+        self.assertEqual(llm_state["history"]["consecutive_migrations_recent"], 1)
+        self.assertEqual(llm_state["history"]["distance_trend_strength"], 1)
+        self.assertNotIn("distance_violation_count_recent", llm_state["current_state"])
         raw = query_llm(prompt, state=llm_state)
         self.assertEqual(raw["objective_mode"], "latency_first")
         self.assertNotIn("solver_mode", raw)
+
+    def test_multi_agent_prompt_uses_decision_summaries_and_forecast_guidance(self) -> None:
+        shared_state = build_shared_control_state(
+            {"state_index": 6, "service_index": 6, "distance_to_user": 6, "recent_direction": 1, "distance_threshold": 3},
+            {"recent_service_distances": [1, 4, 5], "recent_migrations": [0, 1, 1]},
+            "migration_sensitive",
+            "reduce migration churn",
+        )
+        self.assertEqual(shared_state["recent_history"]["distance_violation_count_recent"], 2)
+        self.assertEqual(shared_state["recent_history"]["consecutive_migrations_recent"], 2)
+        self.assertEqual(shared_state["recent_history"]["distance_trend_strength"], 5)
+        self.assertNotIn("distance_violation_count_recent", shared_state["current_state"])
+
+        forecaster_prompt = build_forecaster_prompt(shared_state)
+        self.assertIn("Do not overreact to a single-step fluctuation", forecaster_prompt)
+
+        policy_prompt = build_policy_advisor_prompt(
+            shared_state,
+            {"distance_trend": "moving_away", "mobility_level": "medium", "stability_risk": "high", "reason": "test"},
+        )
+        self.assertIn("explain in reason how the recommendation responds to the forecast", policy_prompt)
+        self.assertIn("If you do not follow the forecast, justify why in reason", policy_prompt)
+        self.assertIn("migration_sensitive prioritizes reducing migration frequency and migration distance", policy_prompt)
 
     def test_multi_agent_forecast_schema_and_merge(self) -> None:
         shared_state = build_shared_control_state(
@@ -181,6 +237,35 @@ class CoreTests(unittest.TestCase):
         self.assertGreaterEqual(result["final_safe_control"]["transmission_weight"], 1.45)
         self.assertLessEqual(result["final_safe_control"]["migration_weight"], 0.95)
 
+    def test_conflict_goal_is_anchored_to_baseline_control(self) -> None:
+        shared_state = build_shared_control_state(
+            {"state_index": 4, "service_index": 4, "distance_to_user": 4, "recent_direction": 2},
+            {"recent_service_distances": [1, 2, 3], "recent_migrations": [0, 1, 0]},
+            "balanced",
+            "This scenario contains conflicting goals: keep service distance low, avoid too many migrations, and suppress switching jitter. Seek a balanced compromise across all three.",
+        )
+        result = query_multi_agent_control(shared_state, backend="mock")
+        self.assertEqual(result["final_safe_control"]["objective_mode"], "balanced")
+        self.assertAlmostEqual(result["final_safe_control"]["gamma"], DEFAULT_SAFE_CONTROL.gamma)
+        self.assertAlmostEqual(result["final_safe_control"]["migration_weight"], DEFAULT_SAFE_CONTROL.migration_weight)
+        self.assertAlmostEqual(result["final_safe_control"]["transmission_weight"], DEFAULT_SAFE_CONTROL.transmission_weight)
+
+    def test_timeout_fallback_stays_close_to_mdp_baseline(self) -> None:
+        result = run_single_user_llm_loop(
+            SingleUserLLMConfig(
+                num_steps=30,
+                llm_refresh_interval=5,
+                controller_mode="multi_agent",
+                llm_backend="mock",
+                failure_mode="timeout",
+                business_profile="latency_sensitive",
+            )
+        )
+        self.assertEqual(
+            result["method_summaries"]["llm_meta_mdp"],
+            result["method_summaries"]["mdp_baseline"],
+        )
+
     def test_apply_control_params_changes_weights(self) -> None:
         base = CostParams(0.9, 0.8, 2.0, -1.0, 1.0, -0.5)
         controlled = apply_control_params(
@@ -224,6 +309,11 @@ class CoreTests(unittest.TestCase):
         self.assertIn("normalization", metric_definition)
         self.assertIn("component_notes", metric_definition)
         self.assertTrue(0.0 <= result["method_summaries"]["llm_meta_mdp"]["evaluation_cost"] <= 1.0)
+        self.assertIn("semantic_metric_definition", result)
+        self.assertIn("semantic_review", result)
+        self.assertEqual(result["semantic_metric_definition"]["business_profile"], "latency_sensitive")
+        self.assertEqual(result["semantic_metric_definition"]["primary_metrics"], ["avg_service_distance"])
+        self.assertIn("llm_meta_mdp", result["semantic_review"]["methods"])
 
     def test_single_user_llm_uses_deterministic_1d_environment_bounds(self) -> None:
         result = run_single_user_llm_loop(
@@ -303,7 +393,9 @@ class CoreTests(unittest.TestCase):
         )
         output_dir = ROOT / "outputs" / "test_multi_agent_plot"
         output_dir.mkdir(parents=True, exist_ok=True)
+        plot_single_user_llm_results(result, str(output_dir))
         plot_single_user_llm_multi_agent_diagnostics(result, str(output_dir))
+        self.assertTrue((output_dir / "single_user_llm_semantic_alignment.png").exists())
         self.assertTrue((output_dir / "single_user_llm_multi_agent_diagnostics.png").exists())
 
     def test_semantic_review_uses_clipped_improvements_for_score(self) -> None:
@@ -337,6 +429,23 @@ class CoreTests(unittest.TestCase):
         self.assertAlmostEqual(
             review["methods"]["llm_meta_mdp"]["semantic_consistency_score"],
             expected_score,
+        )
+
+    def test_semantic_review_keeps_zero_baseline_improvements_finite(self) -> None:
+        review = build_semantic_review(
+            {
+                "mdp_baseline": {"avg_migration_count": 0.0},
+                "llm_meta_mdp": {"avg_migration_count": 0.5},
+            },
+            ["avg_migration_count"],
+        )
+        self.assertEqual(
+            review["semantic_primary_improvements_raw"]["llm_meta_mdp"]["avg_migration_count"],
+            -1.0,
+        )
+        self.assertEqual(
+            review["semantic_primary_improvements_clipped"]["llm_meta_mdp"]["avg_migration_count"],
+            -1.0,
         )
 
     def test_semantic_review_labels_follow_threshold_constants(self) -> None:
